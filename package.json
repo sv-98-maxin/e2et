@@ -1,0 +1,62 @@
+{
+  "name": "e2et",
+  "version": "0.1.0",
+  "description": "Deterministic browser actions, trace-to-IR compilation, replay and native E2E reports",
+  "type": "module",
+  "bin": {
+    "e2et": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:runtime": "node scripts/run-runtime-unit-tests.cjs",
+    "test:package": "node scripts/verify-package.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check:architecture": "node scripts/check-architecture.mjs",
+    "bundle": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.js --external:bufferutil --external:utf-8-validate --legal-comments=external --banner:js=\"import{createRequire as __bundleCreateRequire}from'module';const require=__bundleCreateRequire(import.meta.url);\"",
+    "prepack": "npm run typecheck && npm run bundle"
+  },
+  "dependencies": {
+    "@playwright/test": "1.64.1",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "zod": "^3.24.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "runtime_assets/runtime",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "THIRD_PARTY_NOTICES.md",
+    "third-party-notices"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public",
+    "tag": "latest"
+  },
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sv-98-maxin/e2et.git"
+  },
+  "keywords": [
+    "e2e",
+    "playwright",
+    "cdp",
+    "test-generation",
+    "ir",
+    "replay"
+  ]
+}

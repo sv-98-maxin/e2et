@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.e2et/
+*.tgz
+test-results/
+playwright-report/

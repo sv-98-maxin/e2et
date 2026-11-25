@@ -1,0 +1,80 @@
+name: Package verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      E2ET_MANAGED_HEADLESS: 'true'
+      HEADLESS: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install public dependencies
+        run: npm ci --registry=https://registry.npmjs.org
+      - name: Install browser prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+          npx --no-install playwright install chromium --with-deps
+          node --input-type=module <<'NODE'
+          import { chromium } from '@playwright/test';
+          import { accessSync, appendFileSync, constants } from 'node:fs';
+          const executable = chromium.executablePath();
+          accessSync(executable, constants.X_OK);
+          appendFileSync(process.env.GITHUB_ENV, `BROWSER_EXECUTABLE_PATH=${executable}\n`);
+          console.log(`BROWSER_EXECUTABLE_PATH=${executable}`);
+          NODE
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Architecture self-test and check
+        run: |
+          npm run check:architecture -- --self-test
+          npm run check:architecture
+      - name: Build source
+        run: npm run build
+      - name: Existing source tests
+        run: npm test -- --pool=forks --no-cache
+      - name: Runtime logic tests
+        run: npm run test:runtime
+      - name: Check runtime mirrors
+        run: bash scripts/sync-runtime-to-agents.sh --dry-run
+      - name: Bundle and pack
+        id: pack
+        run: |
+          npm run bundle
+          npm pack --dry-run --ignore-scripts
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/e2et-pack.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const [packed] = JSON.parse(readFileSync(join(process.env.RUNNER_TEMP, 'e2et-pack.json'), 'utf8'));
+          appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${join(process.env.RUNNER_TEMP, packed.filename)}\n`);
+          NODE
+      - name: Verify the installed tarball
+        run: npm run test:package -- '${{ steps.pack.outputs.tarball }}'
+      - name: Upload native reports and receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-verification
+          include-hidden-files: true
+          if-no-files-found: warn
+          path: |
+            ~/.e2et/workspace/package-verification-*/receipt.json
+            ~/.e2et/workspace/package-verification-*/**/report.json
+            ~/.e2et/workspace/package-verification-*/**/report.html
+            ~/.e2et/workspace/package-verification-*/**/html-report/**
+            !~/.e2et/workspace/package-verification-*/**/node_modules/**
+            !~/.e2et/workspace/package-verification-*/private/**
