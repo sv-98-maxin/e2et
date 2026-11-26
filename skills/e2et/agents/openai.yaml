@@ -1,6 +1,0 @@
-interface:
-  display_name: "e2et"
-  short_description: "e2et CLI 配套：网页验证、原生报告、IR 编译和本地用例回放"
-  default_prompt: "使用 $e2et 按本次 URL、预期和授权执行网页验证，交付原生报告；需要时保存或回放本地用例"
-policy:
-  allow_implicit_invocation: true

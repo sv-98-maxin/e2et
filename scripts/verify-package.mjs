@@ -327,7 +327,7 @@ async function main() {
   const archivedRuntime = Object.fromEntries(archiveFiles.filter(file => file.startsWith('package/runtime_assets/runtime/')).map(file =>
     [file.slice('package/runtime_assets/runtime/'.length), sha(archive(file.slice('package/'.length)))]));
   assert.deepEqual(runtimeHashes, archivedRuntime);
-  const skillFiles = ['SKILL.md', 'agents/openai.yaml', 'references/setup-auth.md', 'references/operations.md',
+  const skillFiles = ['SKILL.md', 'references/setup-auth.md', 'references/operations.md',
     'references/ui-check.md', 'references/acceptance.md', 'references/tool-issues.md', 'references/cases.md'].sort();
   const sourceSkillHashes = manifest(path.join(root, 'skills', 'e2et'));
   assert.deepEqual(Object.keys(sourceSkillHashes).sort(), skillFiles, 'Unexpected Skill manifest');
