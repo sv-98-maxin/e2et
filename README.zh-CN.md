@@ -2,46 +2,20 @@
 
 [English](README.md)
 
-e2et 是确定性的 E2E 命令行工具：浏览器动作、断言、录制、trace → IR 编译、
-回放和原生 HTML 报告。人或宿主 Agent 决定执行什么，CLI 执行动作并留证据。
-不内置 AI 循环，不依赖平台服务、MCP server 或内网 registry。
+e2et 是浏览器自动化与端到端测试命令行工具。支持页面操作、断言、录制、
+生成可回放用例，以及带截图和执行证据的 HTML 报告。
 
 ## 安装
 
-需要 **Node.js 20+**。从公开 npm 安装：
+需要 **Node.js 20+**，以及本机安装的 **Google Chrome 或 Chromium**。
 
 ```sh
-npm install -g e2et@0.1.0 --registry=https://registry.npmjs.org
+npm install -g e2et
 e2et --version
-e2et commands --json
-```
-
-同版本的 GitHub Release tarball 可作为备用安装入口：
-
-```sh
-npm install --global --registry=https://registry.npmjs.org \
-  https://github.com/sv-98-maxin/e2et/releases/download/v0.1.0/e2et-0.1.0.tgz
-```
-
-managed 浏览器使用精确 **Playwright 1.64.1** 对应的 Chromium：
-
-```sh
-npx --yes --registry=https://registry.npmjs.org --package=@playwright/test@1.64.1 \
-  playwright install chromium
-```
-
-Linux 改用 `playwright install chromium --with-deps` 同时安装系统依赖。
-Chrome profile 复制还需要 `rsync`。从已安装 e2et 的依赖读取本次可执行文件路径：
-
-```sh
-export BROWSER_EXECUTABLE_PATH="$(node --input-type=commonjs -e \
-  'const {createRequire}=require("node:module"); const r=createRequire(process.argv[1]); process.stdout.write(r("@playwright/test").chromium.executablePath());' \
-  "$(npm root -g)/e2et/package.json")"
 e2et setup
 ```
 
-`setup` 建工作目录并报告浏览器前置，不负责登录。
-本地构建可用 `npm install --global /绝对路径/e2et-0.1.0.tgz` 安装。
+Playwright 会随 npm 依赖自动安装。`e2et setup` 创建本地工作目录并检查浏览器是否可用。
 
 ## 登录态与浏览器
 
@@ -58,8 +32,8 @@ e2et session start --auth imported --browser managed
 
 `auto` 根据可用来源选择；有效显式 state 配 `auto` 使用 `imported`。
 `profile` 使用系统 Google Chrome 的专用副本，不能拿 Playwright Chromium 替代。
-当前 `auth import --chrome` **只支持 macOS**，复制本机 Chrome profile、使用钥匙串，
-并验证显式提供的 URL：
+当前 `auth import --chrome` **只支持 macOS**，用 `rsync` 复制本机 Chrome profile、
+使用钥匙串，并验证显式提供的 URL：
 
 ```sh
 e2et auth import --chrome --url https://your-app.example/
@@ -128,7 +102,7 @@ e2et case run my_case \
 ## 开发与验证
 
 ```sh
-npm ci --registry=https://registry.npmjs.org
+npm ci
 npx --no-install playwright install chromium
 export BROWSER_EXECUTABLE_PATH="$(node -p "require('@playwright/test').chromium.executablePath()")"
 npm run typecheck

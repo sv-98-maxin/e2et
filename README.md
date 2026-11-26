@@ -2,51 +2,22 @@
 
 [中文](README.zh-CN.md)
 
-e2et is a deterministic E2E CLI for browser actions, assertions, recording,
-trace-to-IR compilation, replay, and native HTML reports. An agent or a person
-chooses the actions; the CLI executes them and records evidence. It has no
-built-in AI loop and needs no platform service, MCP server, or private registry.
+e2et is a command-line tool for browser automation and end-to-end testing.
+Record browser interactions, run assertions, generate reusable tests, and
+inspect the results in HTML reports with screenshots and execution evidence.
 
 ## Install
 
-Requires Node.js **20 or newer**. Install the public npm package:
+Requires **Node.js 20+** and a local **Google Chrome or Chromium** installation.
 
 ```sh
-npm install -g e2et@0.1.0 --registry=https://registry.npmjs.org
+npm install -g e2et
 e2et --version
-e2et commands --json
-```
-
-The same version is also available as a GitHub Release tarball:
-
-```sh
-npm install --global --registry=https://registry.npmjs.org \
-  https://github.com/sv-98-maxin/e2et/releases/download/v0.1.0/e2et-0.1.0.tgz
-```
-
-Install the matching Playwright **1.64.1** Chromium for managed browsers:
-
-```sh
-npx --yes --registry=https://registry.npmjs.org --package=@playwright/test@1.64.1 \
-  playwright install chromium
-```
-
-On Linux, use `playwright install chromium --with-deps` to install the browser's
-system dependencies too. Chrome profile copying also requires `rsync`.
-
-Select the executable from the installed e2et dependency, rather than guessing a
-browser cache path:
-
-```sh
-export BROWSER_EXECUTABLE_PATH="$(node --input-type=commonjs -e \
-  'const {createRequire}=require("node:module"); const r=createRequire(process.argv[1]); process.stdout.write(r("@playwright/test").chromium.executablePath());' \
-  "$(npm root -g)/e2et/package.json")"
 e2et setup
 ```
 
-`setup` prepares the workspace and reports browser prerequisites. It does not
-log in. Local builds can be installed with
-`npm install --global /absolute/path/e2et-0.1.0.tgz`.
+Playwright is installed automatically as a package dependency. `e2et setup`
+creates the local workspace and checks browser availability.
 
 ## Authentication and browsers
 
@@ -66,7 +37,8 @@ fail; the CLI does not retry a failed action using another identity.
 `imported`. `profile` uses a dedicated copy of a system Google Chrome profile;
 Playwright Chromium is not a replacement for that profile browser. The current
 `auth import --chrome` implementation supports **macOS only**, uses the local
-Chrome profile and keychain, and verifies an explicitly supplied URL:
+Chrome profile and keychain, requires `rsync` for profile copying, and verifies
+an explicitly supplied URL:
 
 ```sh
 e2et auth import --chrome --url https://your-app.example/
@@ -145,7 +117,7 @@ inputs. A same-command state plus `profile`/`chrome` is rejected. Explicit
 ## Develop and verify
 
 ```sh
-npm ci --registry=https://registry.npmjs.org
+npm ci
 npx --no-install playwright install chromium
 export BROWSER_EXECUTABLE_PATH="$(node -p "require('@playwright/test').chromium.executablePath()")"
 npm run typecheck
