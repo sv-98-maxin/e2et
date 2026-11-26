@@ -1,6 +1,6 @@
 {
   "name": "@coder_maxin/e2et",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministic browser actions, trace-to-IR compilation, replay and native E2E reports",
   "type": "module",
   "bin": {

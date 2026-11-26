@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Expand the English and Chinese quickstarts with a repeatable local page and report/replay guidance.
+- Simplify the optional e2et companion Skill and align package verification with its files.
+
 ## 0.1.0
 
 First standalone public release as `@coder_maxin/e2et`.
