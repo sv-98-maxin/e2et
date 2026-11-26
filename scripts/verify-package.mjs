@@ -30,7 +30,7 @@ const state = path.join(privateDir, 'state.json');
 const caseName = `pkg_${randomUUID().replaceAll('-', '')}`;
 const caseRoot = path.join(defaultRoot, 'library', caseName);
 const cli = path.join(prefix, 'bin', 'e2et');
-const installedRoot = path.join(prefix, 'lib', 'node_modules', 'e2et');
+const installedRoot = path.join(prefix, 'lib', 'node_modules', expectedPackage.name);
 const sourceCli = path.join(root, 'dist', 'cli.js');
 const cleanEnv = { ...process.env };
 for (const key of Object.keys(cleanEnv)) {
@@ -301,10 +301,10 @@ async function main() {
   assert(Object.values(lock.packages).every(pkg => !pkg.resolved || pkg.resolved.startsWith('https://registry.npmjs.org/')), 'Private lockfile registry');
   const archiveFiles = execFileSync('tar', ['-tzf', tarball], { encoding: 'utf8' }).trim().split('\n');
   assert(archiveFiles.every(file => file.startsWith('package/') && !file.split('/').includes('..')), 'Unsafe archive path');
-  assert(archiveFiles.every(file => /^package\/(dist\/|runtime_assets\/runtime\/|third-party-notices\/|package\.json$|README(?:\.zh-CN)?\.md$|CHANGELOG\.md$|LICENSE$|THIRD_PARTY_NOTICES\.md$)/.test(file)), 'Unexpected package content');
+  assert(archiveFiles.every(file => /^package\/(dist\/|skills\/e2et\/|runtime_assets\/runtime\/|third-party-notices\/|package\.json$|README(?:\.zh-CN)?\.md$|CHANGELOG\.md$|LICENSE$|THIRD_PARTY_NOTICES\.md$)/.test(file)), 'Unexpected package content');
   const archive = name => execFileSync('tar', ['-xOf', tarball, `package/${name}`], { maxBuffer: 32 * 1024 * 1024 });
   const packed = JSON.parse(archive('package.json').toString('utf8'));
-  assert.equal(packed.name, 'e2et');
+  assert.equal(packed.name, expectedPackage.name);
   assert.equal(packed.version, expectedPackage.version);
   assert.deepEqual(packed.dependencies, expectedPackage.dependencies);
   assert.deepEqual(packed.bin, { e2et: 'dist/cli.js' });
@@ -327,6 +327,15 @@ async function main() {
   const archivedRuntime = Object.fromEntries(archiveFiles.filter(file => file.startsWith('package/runtime_assets/runtime/')).map(file =>
     [file.slice('package/runtime_assets/runtime/'.length), sha(archive(file.slice('package/'.length)))]));
   assert.deepEqual(runtimeHashes, archivedRuntime);
+  const skillFiles = ['SKILL.md', 'agents/openai.yaml', 'references/setup-auth.md', 'references/operations.md',
+    'references/ui-check.md', 'references/acceptance.md', 'references/tool-issues.md', 'references/cases.md'].sort();
+  const sourceSkillHashes = manifest(path.join(root, 'skills', 'e2et'));
+  assert.deepEqual(Object.keys(sourceSkillHashes).sort(), skillFiles, 'Unexpected Skill manifest');
+  const archivedSkill = Object.fromEntries(archiveFiles.filter(file => file.startsWith('package/skills/e2et/')).map(file =>
+    [file.slice('package/skills/e2et/'.length), sha(archive(file.slice('package/'.length)))]));
+  assert.deepEqual(sourceSkillHashes, archivedSkill, 'Tarball Skill files mismatch');
+  const installedSkillHashes = manifest(path.join(installedRoot, 'skills', 'e2et'));
+  assert.deepEqual(installedSkillHashes, sourceSkillHashes, 'Installed Skill files mismatch');
   const installedCliSha = fileSha(fs.realpathSync(cli));
   assert.equal(installedCliSha, sha(archive('dist/cli.js')));
   assert.equal(installedCliSha, fileSha(sourceCli), 'Tarball does not match the current source build');
@@ -343,7 +352,7 @@ async function main() {
     assert(fs.statSync(path.join(depRoot, 'NOTICE')).size > 0);
     if (dependency !== '@playwright/test') assert(fs.statSync(path.join(depRoot, 'ThirdPartyNotices.txt')).size > 0);
   }
-  receipt.installed = { prefix, cli, real_cli: fs.realpathSync(cli), cli_sha256: installedCliSha, runtime_sha256: runtimeHashes,
+  receipt.installed = { prefix, cli, real_cli: fs.realpathSync(cli), cli_sha256: installedCliSha, runtime_sha256: runtimeHashes, skill_sha256: installedSkillHashes,
     dependencies: { '@playwright/test': playwrightVersion, ws: readJson(requireInstalled.resolve('ws/package.json')).version } };
   const browserPath = await command('chromium-path', process.execPath, ['-e', 'const {createRequire}=require("node:module"); const r=createRequire(process.argv[1]); console.log(r("@playwright/test").chromium.executablePath());', path.join(installedRoot, 'package.json')], cleanEnv);
   assert.equal(browserPath.code, 0);

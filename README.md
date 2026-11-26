@@ -2,57 +2,41 @@
 
 [中文](README.zh-CN.md)
 
-e2et is a command-line tool for browser automation and end-to-end testing.
-Use it directly or let an AI agent drive it to test pages and produce execution evidence.
-
 ## What it does
 
-- Operate web pages: navigate, click, fill forms, select options, and inspect page state.
-- Verify results with assertions, screenshots, and HTML reports.
-- Record interactions and turn them into reusable tests for regression runs.
-- Locate elements through standard DOM and ARIA semantics across component libraries.
+e2et is a browser-testing CLI. It opens pages, uses standard DOM and ARIA semantics to operate them, checks visible results, captures evidence, and produces a native HTML report.
 
-## How it works
+It can also record an authorized interaction into a reusable test, save that test locally, and replay it later with fresh input values.
 
-Browser actions → trace → IR → Playwright replay → HTML report
+## How Agent + Skill + CLI work
 
-The CLI controls the browser through CDP, Chrome's remote debugging protocol,
-and records actions and observations in a trace. It compiles that trace into IR,
-a structured test case that can be checked, saved, and replayed through Playwright.
+The CLI drives the browser through CDP, records actions and observations in a trace, compiles the trace into IR, and replays saved cases through Playwright. The Agent turns your goal into concrete actions and assertions, then chooses the next step from the CLI's JSON results.
 
-Commands return JSON so agents can plan the steps, inspect results, and decide
-what to do next. Reports bring together assertions, screenshots, and execution evidence.
+The companion Skill is recommended but optional: it only gives an Agent tested guidance for using the CLI. You can call the CLI independently or use your own Skill.
 
 ## Install
 
-Requires **Node.js 20+** and a local **Google Chrome or Chromium** installation.
+The CLI requires Node.js 20+ and a local Google Chrome or Chromium installation.
+
+**CLI**
 
 ```sh
-npm install -g e2et
+npm install -g @coder_maxin/e2et
 e2et setup
 ```
 
-## Usage
+**Companion Skill**
 
-Try a public page with an empty login state:
-
-```sh
-echo '{"cookies":[],"origins":[]}' | e2et auth import
-e2et session start --auth imported --browser managed
-```
-
-Replace `SESSION_ID` with the `session_id` returned by the previous command:
+The `skills` installer requires Node.js 22.20+.
 
 ```sh
-e2et page open -s SESSION_ID https://example.com --intent "Open example" --group smoke
-e2et assert text -s SESSION_ID "documentation examples" --group smoke
-e2et page screenshot -s SESSION_ID --intent "Capture result" --group smoke
-e2et session stop -s SESSION_ID
-e2et report -s SESSION_ID
+npx skills add sv-98-maxin/e2et --skill e2et
 ```
 
-The report command returns the HTML report path. Local data is stored under `~/.e2et`.
-For pages that require a login, prepare it with `e2et auth login --url <page-url>`.
-See `e2et --help` for more commands.
+## Use it in natural language
 
-Licensed under ISC. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency licenses.
+- "Use e2et to open `https://example.com`, confirm the page shows `Example Domain`, capture the completed state, and give me the native test report."
+- "Use e2et with the storage state at `/path/to/state.json` to verify this page, and stop before any save or submit action."
+- "Record this form flow as the case `profile-edit`, then replay it with a fresh test name."
+
+For direct CLI discovery, run `e2et --help` or `e2et commands --json`.

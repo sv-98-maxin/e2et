@@ -1,5 +1,5 @@
 {
-  "name": "e2et",
+  "name": "@coder_maxin/e2et",
   "version": "0.1.0",
   "description": "Deterministic browser actions, trace-to-IR compilation, replay and native E2E reports",
   "type": "module",
@@ -35,6 +35,7 @@
   },
   "files": [
     "dist",
+    "skills/e2et",
     "runtime_assets/runtime",
     "README.zh-CN.md",
     "CHANGELOG.md",

@@ -2,56 +2,41 @@
 
 [English](README.md)
 
-e2et 是浏览器自动化与端到端测试命令行工具。
-你可以直接使用，也可以交给 AI Agent 调用，完成页面验证并留下执行证据。
+## 能干啥
 
-## 能做什么
+e2et 是一个浏览器测试 CLI。它会打开页面，按标准 DOM 和 ARIA 语义操作，核对可见结果，保存证据，并生成原生 HTML 测试报告。
 
-- 操作网页：打开页面、点击、填写表单、选择选项、查看页面状态。
-- 验证结果：执行断言、截取页面截图、生成 HTML 测试报告。
-- 沉淀回归用例：录制交互，生成可保存、可重复回放的测试。
-- 跨组件库定位：通过标准 DOM 和 ARIA 语义操作页面元素。
+它也能把一次已授权的页面操作录制成可复用用例，保存到本地，之后用新的输入值回放。
 
-## 实现方式
+## Agent + Skill + CLI 怎么配合
 
-页面操作 → trace → IR → Playwright 回放 → HTML 报告
+CLI 通过 CDP 驱动浏览器，把动作和观察记录成 trace，再编译为 IR，并通过 Playwright 回放保存的用例。Agent 把目标转成具体动作和断言，再根据 CLI 返回的 JSON 决定下一步。
 
-CLI 通过 CDP（Chrome 的远程调试协议）控制浏览器，把动作和观察结果录成 trace。
-再将 trace 编译成 IR，也就是一份结构化用例，经过校验后交给 Playwright 回放。
-
-命令返回 JSON，AI Agent 可以据此规划步骤、检查结果、决定下一步动作。
-报告汇总断言、截图和执行证据，方便定位失败原因。
+配套 Skill 推荐但可选：它只给 Agent 提供经过验证的 e2et 使用指南。你可以独立调用 CLI，也可以用自己的 Skill。
 
 ## 安装
 
-需要 **Node.js 20+**，以及本机安装的 **Google Chrome 或 Chromium**。
+CLI 需要 Node.js 20+，以及本机安装的 Google Chrome 或 Chromium。
+
+**CLI**
 
 ```sh
-npm install -g e2et
+npm install -g @coder_maxin/e2et
 e2et setup
 ```
 
-## 使用
+**配套 Skill**
 
-先用空登录态测试一个公开页面：
-
-```sh
-echo '{"cookies":[],"origins":[]}' | e2et auth import
-e2et session start --auth imported --browser managed
-```
-
-将返回的 `session_id` 替换到下面的 `SESSION_ID`：
+`skills` 安装器需要 Node.js 22.20+。
 
 ```sh
-e2et page open -s SESSION_ID https://example.com --intent "打开示例页面" --group smoke
-e2et assert text -s SESSION_ID "documentation examples" --group smoke
-e2et page screenshot -s SESSION_ID --intent "截取结果" --group smoke
-e2et session stop -s SESSION_ID
-e2et report -s SESSION_ID
+npx skills add sv-98-maxin/e2et --skill e2et
 ```
 
-报告命令会返回 HTML 文件路径，本地数据保存在 `~/.e2et`。
-需要登录的业务页面，先用 `e2et auth login --url <页面URL>` 准备登录态。
-其他命令可通过 `e2et --help` 查看。
+## 自然语言使用示例
 
-采用 ISC 许可，依赖许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- “用 e2et 打开 `https://example.com`，确认页面显示 `Example Domain`，截取完成态并给我原生测试报告。”
+- “用 e2et 和 `/path/to/state.json` 这份登录态验证这个页面，任何保存或提交动作都先停下。”
+- “把这次表单流程保存为用例 `profile-edit`，然后用一个新的测试名称回放一次。”
+
+直接使用 CLI 时，可从 `e2et --help` 或 `e2et commands --json` 开始。
