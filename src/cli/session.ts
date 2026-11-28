@@ -7,6 +7,7 @@ import {
   readMeta,
   resolveSocketPath,
   sessionsDir,
+  traceDir,
   writeMeta,
 } from '../daemon/session-meta.js';
 import { DaemonClient, DaemonClientError } from '../daemon/client.js';
@@ -18,6 +19,7 @@ import { cliDistPath, diag, emitError, emitOk, EXIT_ENV, EXIT_USAGE, EXIT_VALIDA
 import { parseArgs } from './args.js';
 import { commandDefinitions } from './commands.js';
 import { redactEndpoint } from './auth.js';
+import { AcceptanceInputError, freezeAcceptance, readAcceptanceInput } from '../report/acceptance.js';
 
 const ENV_LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -48,10 +50,23 @@ async function sessionStart(d: Deps, argv: string[]): Promise<number> {
   const conflict = incompatibleBrowserAuth(browserMode, authMode);
   if (conflict) return emitError(d, 'USAGE', conflict, undefined, EXIT_USAGE);
   const childEnv = { ...d.env };
+  delete childEnv.E2ET_RUN_ACCEPTANCE_DIR;
+  delete childEnv.E2ET_RUN_ID;
   if (authMode === 'profile' || browserMode === 'chrome') delete childEnv.E2ET_AUTH_STATE;
   const authStateError = explicitAuthStateInputError(childEnv);
   if (authStateError) return emitError(d, 'USAGE', authStateError, undefined, EXIT_USAGE);
   const id = generateSessionId();
+  try {
+    const acceptance = readAcceptanceInput(values['--acceptance']);
+    if (acceptance) {
+      const directory = traceDir(id, d.env);
+      freezeAcceptance(acceptance, directory);
+      childEnv.E2ET_RUN_ACCEPTANCE_DIR = directory;
+    }
+  } catch (error) {
+    if (error instanceof AcceptanceInputError) return emitError(d, error.code, error.message, undefined, EXIT_USAGE);
+    throw error;
+  }
   const socketPath = resolveSocketPath(id, d.env);
   fs.mkdirSync(sessionsDir(d.env), { recursive: true });
   try { fs.rmSync(socketPath, { force: true }); } catch { /* ignore */ }

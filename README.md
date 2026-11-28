@@ -128,9 +128,11 @@ For a later regression, replay the saved case (this is **another real execution*
 e2et case run example-domain --auth imported --browser managed --auth-state "$auth_state"
 ```
 
-For `case run`, require `data.status=passed` and inspect `data.run_dir` / `data.report`. Replay JSON is Playwright's report, not the Source schema: read the final test result's `ir-report` attachment (decode an inline base64 body, or read its attached file) and check its `result=PASS`, cases, steps, and assertions. A missing attachment is not PASS.
+For `case run`, require `data.status=passed` and read the final schema 2 report at `data.report.facts_json`: check `result=PASS`, cases, steps, assertions, and acceptance coverage. Cross-check it against the original Playwright JSON at `data.report.json`, including the final test result and errors, and the native HTML at `data.report.playwright_html`. The `ir-report` attachment is intermediate evidence; it cannot establish the final result. For `land`, use the same paths under `data.verification.report`; failures return the files that actually exist under `error.evidence`.
 
-`verify` also performs a real replay by default (`--skip-test` skips it). Do not add it before `land` by habit: that would execute the page steps again. `render` only recompiles IR; `data.status=compiled` and `data.replay=not_run` are **not replay evidence**. `case run` executes the saved test bytes, without rebuilding from the original trace.
+The report's `sessionId` identifies this replay run; `cases[].recording.session_id` identifies the recorded Source session. Current tool, CLI/runtime hashes, browser, and identity belong to `cases[].run`. The `runtime-environment` attachment records startup with status `BLOCKED`; read the final status from `facts_json` and Playwright's final result.
+
+`verify` also performs a real replay by default (`--skip-test` skips it and produces a `BLOCKED` facts report). Do not add it before `land` by habit: that would execute the page steps again. `render` only recompiles IR; `data.status=compiled` and `data.replay=not_run` are **not replay evidence**. `case run` executes the saved test bytes, without rebuilding from the original trace.
 
 ## Paths, identity, and safety
 

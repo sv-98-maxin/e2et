@@ -28,6 +28,7 @@ import type { Locator } from './types.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { hoverEnter, hoverLeave, isHoverRelated } from './shared/dom-actions.js';
+import type { ReportEvent } from './shared/report-model.js';
 
 const prepareInputEval = prepareWriteTargetEval();
 const inputReadyEval = assertWriteReadyEval();
@@ -134,6 +135,8 @@ export interface ActionResult {
   /** §8 输出合同：choose/category 实际 picked label 数组 JSON（save_as 绑定源） */
   outputValue?: string;
 }
+
+export type ActionObservation = Partial<Pick<ReportEvent, 'target' | 'input' | 'valueSource'>>;
 
 export interface HoverState {
   target?: ElementHandle<SVGElement | HTMLElement>;
@@ -542,6 +545,7 @@ export async function executeAction(
   fixtureDir: string,
   hoverState: HoverState | undefined,
   recordInput: RecordInputCallback,
+  observed?: (fact: ActionObservation) => void,
 ): Promise<ActionResult> {
   hoverState ??= {};
   const action = step.action;
@@ -569,13 +573,19 @@ export async function executeAction(
     return rem;
   };
   const actionOptions = (): { timeout: number } | undefined => (hasFallback ? { timeout: remaining() } : undefined);
+  const recordTarget = (target: import('./locator.js').LocatorObservation): void => { observed?.({ target }); };
+  const resolveValue = (value: Value): string => {
+    const resolved = vctx.resolve(value);
+    observed?.({ input: resolved, valueSource: value });
+    return resolved;
+  };
 
   let interactionLocator: PlaywrightLocator | undefined;
   if (hoverState.target) {
     if (['open', 'hover', 'back', 'refresh', 'switch_tab'].includes(action) || !step.locator || hoverState.page !== page) {
       await clearHover(hoverState);
     } else {
-      interactionLocator = await resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined);
+      interactionLocator = await resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined, recordTarget);
       const target = await interactionLocator.elementHandle({ timeout: remaining() });
       if (!target) throw new Error('hover 关联判断缺少实际目标');
       let related: boolean;
@@ -589,12 +599,12 @@ export async function executeAction(
   }
   const actionLocator = (): Promise<PlaywrightLocator> => interactionLocator
     ? Promise.resolve(interactionLocator)
-    : resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined);
+    : resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined, recordTarget);
 
   switch (action) {
     case 'open': {
       // 中央守卫保证 step.value 存在（open 必需 Value，不回退 args.url 槽）
-      const url = vctx.resolve(step.value!);
+      const url = resolveValue(step.value!);
       // URL 守卫（已审合同）：一次 resolve 后按实际替换事实判定，真改写即固定错误码，
       // 在任何 URL 日志/goto 前失败；非改写继续用原串，返回同一 resolvedValue
       const evidence = redactUrlWithEvidence(url);
@@ -655,7 +665,7 @@ export async function executeAction(
     case 'type': {
       const loc = await actionLocator();
       // 中央守卫保证 step.value 存在（不回退 args.text 槽）
-      const val = vctx.resolve(step.value!);
+      const val = resolveValue(step.value!);
       // 输入日志只打印动作与 step.id，不打印 val（原值不入 stdout）
       console.log(`📝 输入 (step: ${step.id})`);
       await writeValue(page, loc, { value: val, mode: 'type' }, recordInput, actionOptions());
@@ -664,7 +674,7 @@ export async function executeAction(
     case 'fill': {
       const loc = await actionLocator();
       // 中央守卫保证 step.value 存在（不回退 args.text 槽）
-      const val = vctx.resolve(step.value!);
+      const val = resolveValue(step.value!);
       console.log(`📝 填写 (step: ${step.id})`);
       await writeValue(page, loc, { value: val, mode: 'fill' }, recordInput, actionOptions());
       return { resolvedValue: val };
@@ -683,7 +693,7 @@ export async function executeAction(
     case 'select': {
       const loc = await actionLocator();
       // 中央守卫保证 step.value 存在（不回退 args.option 槽）
-      const val = vctx.resolve(step.value!);
+      const val = resolveValue(step.value!);
       console.log(`📝 选择 (step: ${step.id})`);
       // 共源原生 select（单次 evaluate，透传预算 options）；非原生走 custom 同池合同；
       // resolvedValue 保留真正 used-input wanted，不换 picked label
@@ -737,7 +747,7 @@ export async function executeAction(
     case 'date': {
       // 基础版：fill ISO 日期字符串（中央守卫保证 step.value 存在，不回退 args.value 槽）
       const loc = await actionLocator();
-      const val = vctx.resolve(step.value!);
+      const val = resolveValue(step.value!);
       console.log(`📝 日期 (step: ${step.id})`);
       await writeValue(page, loc, { value: val, mode: 'fill' }, recordInput, actionOptions());
       return { resolvedValue: val };
@@ -815,6 +825,7 @@ export async function executeAction(
         const val = fields[name];
         if (val === undefined) throw new Error(`❌ fill_form 字段 "${name}" 缺 fields 值声明 (step: ${step.id})`);
         const resolved = vctx.resolve(val);
+        observed?.({ target: { candidate: locator }, input: { field: name, value: resolved }, valueSource: val });
         await writeValue(page, loc, { value: resolved, mode: 'fill' }, recordInput);
         used.push([name, resolved]);
       }
@@ -823,7 +834,7 @@ export async function executeAction(
     }
     case 'hover': {
       if (!step.locator) throw new Error(`hover action requires a locator (step: ${step.id})`);
-      const loc = await resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined);
+      const loc = await resolveLocatorWithFallback(page, step.locator, step.fallback, step.frame, hasFallback ? remaining() : undefined, recordTarget);
       console.log(`🖱️ 悬停: ${step.intent}`);
       const target = await loc.elementHandle({ timeout: remaining() });
       if (!target) throw new Error('hover 未取得实际目标');

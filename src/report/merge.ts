@@ -4,7 +4,14 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { sessionsDir, traceDir, e2etRoot } from '../daemon/session-meta.js';
 import { ensurePrivateDir } from '../daemon/trace.js';
-import { renderReportHtml, type ReportCase, type ReportCoverage, type ReportData, type ReportStep, type ReportStepApi } from '../shared/report-render.js';
+import { renderReportHtml } from '../shared/report-render.js';
+import type { ReportCase, ReportCoverage, ReportData, ReportStep } from '../shared/report-model.js';
+import { projectReportValue } from '../shared/acceptance.js';
+import { buildReportApis } from './apis.js';
+import { AcceptanceInputError, readAcceptanceSnapshot } from './acceptance.js';
+import { SourceFactsError, buildSourceFacts, projectSourceRecord, type SourceFacts } from './source-facts.js';
+import { readReportFlow } from './flow.js';
+export { buildReportApis } from './apis.js';
 
 type Ev = Record<string, unknown>;
 type Result = ReportCase['result'];
@@ -33,6 +40,7 @@ function validStep(v: unknown): v is ReportStep {
     && ['action', 'observation', 'duration'].every(k => typeof v[k] === 'string')
     && (v.group === undefined || typeof v.group === 'string')
     && (v.actionIds === undefined || strings(v.actionIds))
+    && strings(v.eventIds)
     && (v.assertDetails === undefined || strings(v.assertDetails))
     && (v.assertions === undefined || Array.isArray(v.assertions) && v.assertions.every(a => record(a) && a.t === 'assert'
       && (a.id === undefined || typeof a.id === 'string') && typeof a.kind === 'string' && typeof a.pass === 'boolean'))
@@ -43,41 +51,25 @@ function validStep(v: unknown): v is ReportStep {
 
 /** 只核原生报告消费的 JSON 结构；业务身份与证据在最终 trace 上逐项核。 */
 function validReport(v: unknown): v is ReportData & Ev {
-  return record(v) && ['title', 'url', 'env', 'summary', 'sessionId', 'session_id', 'toolVersion'].every(k => typeof v[k] === 'string')
+  return record(v) && v.report_schema_version === 2 && ['title', 'url', 'env', 'summary', 'sessionId', 'session_id', 'toolVersion'].every(k => typeof v[k] === 'string')
     && results.includes(String(v.result)) && results.includes(String(v.conclusion)) && typeof v.mocked === 'boolean'
     && validCoverage(v.coverage) && strings(v.findings)
     && record(v.actions) && typeof v.actions.total === 'number' && typeof v.actions.success === 'number'
     && ['assert_details', 'diagnostic_assertions', 'diagnostic_observations'].every(k => Array.isArray(v[k]) && (v[k] as unknown[]).every(record))
     && Array.isArray(v.cases) && v.cases.length > 0 && v.cases.every(c => record(c)
       && typeof c.id === 'string' && !!c.id && typeof c.name === 'string' && results.includes(String(c.result))
-      && Array.isArray(c.steps) && c.steps.length > 0 && c.steps.every(validStep)
+      && Array.isArray(c.steps) && c.steps.every(validStep)
+      && Array.isArray(c.events) && c.events.every(event => record(event) && typeof event.id === 'string' && Number.isInteger(event.sequence)
+        && ['action', 'assert', 'capture', 'screenshot', 'observation', 'error'].includes(String(event.type))
+        && ['pass', 'fail', 'error', 'not_run'].includes(String(event.status)))
+      && Array.isArray(c.images) && c.images.every(image => record(image) && typeof image.id === 'string' && typeof image.eventId === 'string' && typeof image.src === 'string')
+      && (c.flow === undefined || record(c.flow) && Number.isFinite(c.flow.startedAt) && Number.isFinite(c.flow.endedAt)
+        && Array.isArray(c.flow.frames) && c.flow.frames.every(frame => record(frame)
+          && typeof frame.src === 'string' && Number.isFinite(frame.startedAt)))
+      && record(c.run) && c.run.mode === 'source' && typeof c.run.id === 'string' && results.includes(String(c.run.status))
       && (c.appendix === undefined || Array.isArray(c.appendix) && c.appendix.every(validStep))
       && (c.summary === undefined || typeof c.summary === 'string') && (c.duration === undefined || typeof c.duration === 'string')
       && (c.findings === undefined || strings(c.findings)) && (c.coverage === undefined || validCoverage(c.coverage)));
-}
-
-/** 原生 report 与 merge 共用同一请求投影；只消费调用方提供的已脱敏 body。 */
-export function buildReportApis(requests: Ev[], ids: string[], readBody: (ref: unknown) => string | undefined): ReportStepApi[] {
-  return ids.flatMap(id => {
-    const r = requests.find(e => e.id === id);
-    if (!r || !['xhr', 'fetch'].includes(String(r.resource_type).toLowerCase())) return [];
-    const url = String(r.url ?? '');
-    const contentType = String(Object.entries((r.resp_headers ?? {}) as Ev).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '');
-    // 敏感路径先于 body 读取，保持原生报告的通用安全词保护。
-    let pathname = '';
-    try { pathname = new URL(url).pathname; } catch { /* 无 URL 不猜接口 */ }
-    if (/(?:cookie|token|password|passwd|pwd|secret|credential|authorization)/i.test(pathname)) return [];
-    if (/html|javascript|css|image\/|font\//i.test(contentType) || /\.(?:html?|js|css|png|jpe?g|svg|woff2?)(?:\?|$)/i.test(url)) return [];
-    const headers = typeof r.resp_headers === 'string' ? r.resp_headers : Object.entries((r.resp_headers ?? {}) as Ev).map(([k, v]) => `${k}: ${v}`).join('\n');
-    return [{ reqId: id, method: String(r.method ?? ''), url, status: String(r.status ?? ''),
-      path: String(r.path ?? ''), nav: String(r.nav ?? ''), callIndex: Number(r.call_index),
-      reqBodyRef: typeof r.req_body_ref === 'string' ? r.req_body_ref : undefined,
-      respBodyRef: typeof r.resp_body_ref === 'string' ? r.resp_body_ref : undefined,
-      reqBody: readBody(r.req_body_ref), respBody: readBody(r.resp_body_ref), respHeaders: headers,
-      traceId: headers.match(/^\s*eagleeye-traceid\s*:\s*(\S+)/im)?.[1],
-      time: typeof r.started === 'number' ? new Date(r.started).toISOString() : undefined,
-    }];
-  });
 }
 
 export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath: (file: string) => boolean, title?: string) {
@@ -106,7 +98,9 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
     const dir = traceDir(sid, env);
     const json = path.join(dir, 'report', 'report.json');
     const report = readJson(json);
+    requireInput(record(report) && report.report_schema_version === 2, `merge 只接受 report_schema_version=2 的 Source 报告: ${sid}`, 'REPORT_SCHEMA');
     requireInput(validReport(report), `原生报告结构无效: ${sid}`);
+    requireInput(report.cases.length === 1 && report.cases[0].run?.id === sid, `Source case/run 来源不符: ${sid}`);
     requireInput(report.sessionId === sid && report.session_id === sid, `报告来源会话不符: ${sid}`);
     requireInput(new Set(report.cases.map(c => c.id)).size === report.cases.length, `原 case id 重复: ${sid}`);
     const trace = readFile(path.join(dir, 'trace.jsonl')).toString('utf8');
@@ -143,22 +137,47 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
       const owned = actions.filter(a => a.group === group);
       const evs = evidence.filter(e => groupOf(e) === group);
       const related = [...new Set([...owned, ...evs.flatMap(e => { const a = byId.get(String(e.after ?? '')); return a ? [a] : []; })])];
-      return { group, owned, related, evidence: evs };
+      return { group, owned, related: related.sort((first, second) => events.indexOf(first) - events.indexOf(second)), evidence: evs };
     });
     const diagnostics = actions.filter(a => !a.group).map(a => ({
       group: undefined, owned: [a], related: [a], evidence: evidence.filter(e => e.after === a.id && !groupOf(e)),
     }));
     const business = groups.length ? buckets : diagnostics;
     const appendix = groups.length ? diagnostics : [];
-    const checkSame = (saved: unknown, actual: unknown, field: string) => requireInput(isDeepStrictEqual(saved, actual), `报告与最终 trace 的 ${field} 不一致（陈旧或证据损坏）: ${sid}`, 'REPORT_STALE');
-    checkSame(report.assert_details, business.flatMap(b => b.evidence.filter(e => e.t === 'assert')), 'assert_details');
-    checkSame(report.diagnostic_assertions, appendix.flatMap(b => b.evidence.filter(e => e.t === 'assert')), 'diagnostic_assertions');
+    const shape = (value: unknown): unknown => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+    const checkSame = (saved: unknown, actual: unknown, field: string) => requireInput(isDeepStrictEqual(saved, shape(actual)), `报告与最终 trace 的 ${field} 不一致（陈旧或证据损坏）: ${sid}`, 'REPORT_STALE');
+    const readImage = (file: string): string | undefined => {
+      requireInput(path.dirname(file) === path.resolve(e2etRoot(env), 'workspace', 'screenshots')
+        && path.basename(file).startsWith(`${sid}_`) && file.endsWith('.png'), `截图来源路径不符: ${sid}`);
+      requireInput(!linkedPath(file), `截图或父目录是 symlink: ${sid}`, 'SYMLINK');
+      if (!fs.lstatSync(file, { throwIfNoEntry: false })) return undefined;
+      const bytes = readFile(file);
+      return bytes.length <= 2 * 1024 * 1024 ? `data:image/png;base64,${bytes.toString('base64')}` : undefined;
+    };
+    let sourceFacts: SourceFacts;
+    try { sourceFacts = buildSourceFacts(sid, trace, readImage, readAcceptanceSnapshot(dir)); }
+    catch (error) {
+      if (error instanceof SourceFactsError || error instanceof AcceptanceInputError) throw new ReportMergeError(error.code, error.message);
+      throw error;
+    }
+    const sourceCase = report.cases[0];
+    checkSame(sourceCase.events, sourceFacts.events, 'events 安全投影');
+    checkSame(sourceCase.images, sourceFacts.images, 'images/引用/截图字节');
+    if (sourceCase.flow !== undefined) checkSame(sourceCase.flow, readReportFlow(sid, env, linkedPath), 'flow/原始帧字节/顺序/时间');
+    checkSame(sourceCase.run, sourceFacts.run, 'Source run/启动版本/身份');
+    checkSame(sourceCase.acceptance, sourceFacts.acceptance, '启动时冻结的 acceptance');
+    checkSame(sourceCase.acceptanceCoverage, sourceFacts.acceptanceCoverage, 'acceptanceCoverage 全部尝试');
+    requireInput(new Set(sourceCase.events!.map(event => event.id)).size === sourceCase.events!.length, `Source event id 重复: ${sid}`);
+    checkSame(report.assert_details, business.flatMap(b => b.evidence.filter(e => e.t === 'assert')).map(projectSourceRecord), 'assert_details');
+    checkSame(report.diagnostic_assertions, appendix.flatMap(b => b.evidence.filter(e => e.t === 'assert')).map(projectSourceRecord), 'diagnostic_assertions');
     const orphanObservations = events.filter(e => e.t === 'observation' && !groupOf(e) && !byId.has(String(e.after ?? '')));
-    checkSame(report.diagnostic_observations, orphanObservations, 'diagnostic_observations');
+    checkSame(report.diagnostic_observations, orphanObservations.map(projectSourceRecord), 'diagnostic_observations');
     checkSame(report.actions, { total: actions.length, success: actions.filter(a => record(a.result) && a.result.ok === true).length }, 'actions');
+    checkSame(report.asserts, { total: events.filter(event => event.t === 'assert').length, pass: events.filter(event => event.t === 'assert' && event.pass === true).length }, '正式检查统计');
+    checkSame(report.captures, { total: events.filter(event => event.t === 'capture').length, pass: events.filter(event => event.t === 'capture' && record(event.result) && event.result.ok === true).length }, 'capture 独立统计');
     const orphanEvidence = evidence.filter(e => !groupOf(e) && !byId.has(String(e.after ?? '')) && e.t !== 'observation');
     for (const e of orphanEvidence) {
-      requireInput(e.t === 'hover_cleanup_error' && !e.after && report.findings?.includes(`会话清理失败：${String(e.error)}`), `全局诊断未保存在原生报告中: ${sid}`, 'REPORT_STALE');
+      if (e.t === 'hover_cleanup_error') requireInput(!e.after && report.findings?.includes(`会话清理失败：${String(e.error)}`), `全局诊断未保存在原生报告中: ${sid}`, 'REPORT_STALE');
     }
 
     const requests = events.filter(e => e.t === 'request');
@@ -185,8 +204,13 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
       const assertions = b.evidence.filter(e => e.t === 'assert');
       const captures = b.evidence.filter(e => e.t === 'capture');
       checkSame(step.actionIds ?? [], b.related.map(a => String(a.id)), 'actionIds');
-      checkSame(step.assertions ?? [], assertions, 'assertions');
-      checkSame(step.captures ?? [], captures, 'captures');
+      checkSame(step.assertions ?? [], assertions.map(projectSourceRecord), 'assertions');
+      checkSame(step.captures ?? [], captures.map(projectSourceRecord), 'captures');
+      const associated = new Set([...b.owned, ...b.evidence].flatMap(event => {
+        const id = sourceFacts.traceEventIds.get(sourceFacts.traceEvents[events.indexOf(event)]);
+        return id ? event.t === 'action' ? [id, `${id}:screenshot`] : [id] : [];
+      }));
+      checkSame(step.eventIds, sourceFacts.events.filter(event => associated.has(event.id)).map(event => event.id), 'step.eventIds 显式引用');
       for (const event of b.evidence.filter(e => e.t === 'hover_cleanup_error')) {
         requireInput(step.observation.includes(`hover 清理失败：${String(event.error)}`), `分组 hover 清理失败未保存在原生报告中: ${sid}/${step.index}`, 'REPORT_STALE');
       }
@@ -209,17 +233,18 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
       }
       checkSame(step.screenshot, screenshot, '截图字节');
       const ids = [...new Set([...b.evidence.flatMap(e => {
-        if (e.t === 'capture') return record(e.from) && typeof e.from.req_id === 'string' ? [e.from.req_id] : [];
+        if (e.t === 'capture') return record(e.result) && record(e.result.from) && typeof e.result.from.req_id === 'string' ? [e.result.from.req_id] : [];
         return Array.isArray(e.evidence) ? e.evidence.flatMap(x => record(x) && typeof x.req_id === 'string' ? [x.req_id] : []) : [];
       }), ...b.owned.flatMap(a => Array.isArray(a.explicit_wait_api) ? a.explicit_wait_api.flatMap(w => record(w) && typeof w.req_id === 'string' ? [w.req_id] : []) : [])])];
       const apis = buildReportApis(requests, ids, readBody);
       // 比较 JSON 落盘形态，省略 undefined 并保留实际证据值。
       checkSame(step.apis ?? [], JSON.parse(JSON.stringify(apis)), '显式请求原始证据');
       const execute = b.related.filter(a => a.kind === 'execute' && Object.hasOwn(a, 'execute_result')).at(-1);
-      checkSame(step.executeResult, execute ? { json: JSON.stringify(execute.execute_result) ?? '缺失', truncated: record(execute.execute_result) && execute.execute_result._truncated === true } : undefined, 'executeResult');
-      const failed = b.owned.some(a => record(a.result) && a.result.ok === false) || assertions.some(a => a.pass !== true)
+      checkSame(step.executeResult, execute ? { json: JSON.stringify(projectReportValue(execute.execute_result).value) ?? '缺失', truncated: record(execute.execute_result) && execute.execute_result._truncated === true } : undefined, 'executeResult');
+      const failed = b.owned.some(a => record(a.result) && a.result.ok === false) || assertions.some(a => a.pass !== true && a.status !== 'not_run')
+        || captures.some(capture => record(capture.result) && capture.result.ok === false)
         || b.evidence.some(e => e.t === 'hover_cleanup_error');
-      const blocked = !assertions.length || !screenshot || report.coverage?.plan !== null && !completion
+      const blocked = !assertions.length || assertions.some(assertion => assertion.status === 'not_run') || !screenshot || report.coverage?.plan !== null && !completion
         || b.owned.some(a => Array.isArray(a.settled_by) && a.settled_by.some(s => record(s) && s.kind === 'timeout'))
         || ids.some(id => !apis.some(a => a.reqId === id && a.respBody));
       const result = tighten(terminal(step.status), failed ? 'FAIL' : blocked ? 'BLOCKED' : 'PASS');
@@ -228,7 +253,9 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
     const cases = report.cases.map(c => {
       const steps = checkSteps(c.steps, business, true);
       const diagnosticSteps = checkSteps(c.appendix ?? [], appendix, false);
-      const result = tighten(c.result, report.result, report.conclusion as Result, sessionResult, ...steps.map(s => terminal(s.status)));
+      const acceptanceResult = sourceFacts.acceptanceCoverage?.result === 'FAIL' ? 'FAIL' : sourceFacts.acceptanceCoverage?.result === 'UNVERIFIED' ? 'BLOCKED' : 'PASS';
+      const imageResult = sourceFacts.events.some(event => event.type === 'screenshot' && event.status === 'error') ? 'BLOCKED' : 'PASS';
+      const result = tighten(c.result, report.result, report.conclusion as Result, sessionResult, sourceFacts.run.status, acceptanceResult, imageResult, ...steps.map(s => terminal(s.status)));
       return { ...c, id: `${sid}:${c.id}`, name: `[${sid}] ${c.name}`, steps, result,
         ...(c.appendix ? { appendix: diagnosticSteps } : {}), summary: c.summary ?? report.summary,
         url: report.url, env: report.env, toolVersion: report.toolVersion, sessionId: sid,
@@ -254,7 +281,7 @@ export function mergeReports(sids: string[], env: NodeJS.ProcessEnv, linkedPath:
   const assertions = steps.flatMap(s => s.assertions ?? []);
   const conclusion = tighten(...cases.map(c => c.result));
   const report: ReportData = {
-    title: title || 'E2E 原生会话报告汇总', url: '', env: [...new Set(cases.map(c => c.env))].join(' / '),
+    report_schema_version: 2, title: String(projectReportValue(title || 'E2E 原生会话报告汇总').value), url: '', env: [...new Set(cases.map(c => c.env))].join(' / '),
     toolVersion: [...new Set(cases.map(c => c.toolVersion))].join(' / '), sessionId: sids.join(', '),
     result: conclusion, mocked: sources.some(s => s.mocked),
     summary: `聚合 ${sids.length} 份原生报告、${cases.length} 个用例、${steps.length} 个业务步骤、${assertions.length} 条断言；仅代表输入报告的验证范围，不能证明完整需求覆盖。各来源终态、环境和覆盖边界见用例详情。`,

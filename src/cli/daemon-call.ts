@@ -1,4 +1,5 @@
-import { readMeta, isPidAlive } from '../daemon/session-meta.js';
+import { readMeta, isPidAlive, traceDir } from '../daemon/session-meta.js';
+import { AcceptanceInputError, acceptanceCheckError, readAcceptanceSnapshot } from '../report/acceptance.js';
 import { DaemonClient, DaemonClientError } from '../daemon/client.js';
 import { isValidDotPath, type PageDataSource } from '../browser/page-data.js';
 import { parseValue } from '../browser/assert.js';
@@ -26,7 +27,7 @@ export function collectCommon(values: Record<string, string>): Record<string, un
   if (values['--save-as']) out.save_as = values['--save-as'];
   if (values['--value-template'] !== undefined) out.value_template = values['--value-template'];
   if (values['--value-ref'] !== undefined) out.value_ref = values['--value-ref'];
-  if (values['--group']) out.group = values['--group'];
+  if (values['--group'] !== undefined) out.group = values['--group'];
   return out;
 }
 
@@ -72,6 +73,17 @@ export async function callDaemon(d: Deps, id: string, method: string, params: Re
   }
   const meta = readMeta(id, d.env);
   if (!meta) return emitError(d, 'NOT_FOUND', `会话不存在: ${id}`, 'e2et session list', EXIT_VALIDATION);
+  if (method.startsWith('assert.') && params.check_id !== undefined) {
+    try {
+      const snapshot = readAcceptanceSnapshot(traceDir(id, d.env));
+      if (snapshot?.sha256 !== meta.acceptance_sha256) throw new AcceptanceInputError('验收快照与会话元数据摘要不一致');
+      const error = params.group === undefined ? undefined : acceptanceCheckError(snapshot, params.check_id, params.group);
+      if (error) return emitError(d, 'ACCEPTANCE_INPUT', error, undefined, EXIT_USAGE);
+    } catch (error) {
+      if (error instanceof AcceptanceInputError) return emitError(d, error.code, error.message, undefined, EXIT_USAGE);
+      throw error;
+    }
+  }
   if (meta.session_end) return emitError(d, 'SESSION_ENDED', `会话已结束: ${meta.session_end.result}`, 'e2et session start', EXIT_VALIDATION);
   if (!isPidAlive(meta.pid)) {
     return emitError(d, 'SESSION_ENDED', 'daemon 进程已不在（aborted）', 'e2et session start', EXIT_VALIDATION);
@@ -91,7 +103,7 @@ export async function callDaemon(d: Deps, id: string, method: string, params: Re
   } catch (e) {
     if (e instanceof DaemonClientError) {
       const unknown = e.code === 'REQUEST_TIMEOUT' || e.code === 'REQUEST_INTERRUPTED';
-      return emitError(d, e.code, e.message, e.hint, unknown ? EXIT_ENV : EXIT_VALIDATION);
+      return emitError(d, e.code, e.message, e.hint, e.code === 'ACCEPTANCE_INPUT' ? EXIT_USAGE : unknown ? EXIT_ENV : EXIT_VALIDATION);
     }
     return emitError(d, 'ENV_UNAVAILABLE', (e as Error).message, undefined, EXIT_ENV);
   } finally {

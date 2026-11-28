@@ -35,6 +35,9 @@ export interface SessionEvent extends TraceEvent {
   schema_version: number;
   env: string;
   tool_version: string;
+  cli_sha256?: string;
+  acceptance_sha256?: string;
+  acceptance_frozen_at?: number;
   auth_source?: string;
   /** P4：真实浏览器来源（chrome-profile / managed / existing；session 事件已记录的字段） */
   browser_source?: string;
@@ -53,6 +56,7 @@ export interface ActionEvent extends TraceEvent {
   id: string;
   kind: string;
   intent: string;
+  group?: string;
   nav: string;
   args?: Record<string, unknown>;
   value?: { raw: string; origin: 'literal' | 'generated' | 'captured'; template?: string; ref?: string };
@@ -133,6 +137,10 @@ export interface AssertEvent extends TraceEvent {
   expect: unknown;
   actual: unknown;
   pass: boolean;
+  group?: string;
+  check_id?: string;
+  status?: 'pass' | 'fail' | 'error' | 'not_run';
+  executed?: boolean;
   evidence?: unknown[];
   target?: ActionEvent['target'];
   within?: ActionEvent['target'];
@@ -174,6 +182,7 @@ export interface CaptureEvent extends TraceEvent {
   t: 'capture';
   after: string;
   as: string;
+  group?: string;
   replayable: boolean;
   result: { ok: true; value: string; from: unknown; lineage: 'created' | 'generated' | 'queried'; path?: string; target?: ActionEvent['target']; read_mode?: 'value' | 'text' } | { ok: false; error: { code: string } };
   frame?: FrameDesc[];

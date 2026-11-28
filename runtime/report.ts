@@ -4,9 +4,12 @@
  */
 import type { ApiRef, IRv2, Step } from './types.js';
 import type { RequestRecord } from './request-tracker.js';
-import type { ReportCase, ReportData, ReportStep, ReportStepApi } from './shared/report-render.js';
-import { jsonPath, diagnoseMissingPath, queryParamValues } from './shared/assertion.js';
+import type { AcceptanceSnapshot, ReportCase, ReportData, ReportEvent, ReportImage, ReportRun, ReportStep, ReportStepApi } from './shared/report-model.js';
+import { projectReportFacts } from './shared/report-finalize.js';
 import { redactText, redactUrl } from './shared/url-safety.js';
+import { createHash, randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 export interface StepOutcome {
   step: Step;
@@ -18,6 +21,33 @@ export interface StepOutcome {
   apis: ReportStepApi[];
   assertions: Record<string, unknown>[];
   captures: Record<string, unknown>[];
+  events?: ReportEvent[];
+}
+
+export function runtimeDigest(directory: string): string {
+  const files: string[] = [];
+  const visit = (parent: string): void => {
+    for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+      if (entry.name === '__tests__') continue;
+      const file = path.join(parent, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile()) files.push(file);
+    }
+  };
+  visit(directory);
+  const manifest = files.map(file => ({ relative: path.relative(directory, file).split(path.sep).join('/'), file }))
+    .sort((first, second) => first.relative < second.relative ? -1 : first.relative > second.relative ? 1 : 0)
+    .map(entry => `${entry.relative}\0${createHash('sha256').update(fs.readFileSync(entry.file)).digest('hex')}\n`).join('');
+  return createHash('sha256').update(manifest).digest('hex');
+}
+
+export function createReplayRun(input: Partial<ReportRun> = {}): ReportRun {
+  return {
+    id: input.id ?? process.env.E2ET_RUN_ID ?? randomUUID(), mode: 'replay', status: 'BLOCKED',
+    startedAt: Date.now(), toolVersion: '',
+    env: process.env.E2ET_RUN_ENV ?? process.env.TEST_ENV ?? 'default',
+    ...input,
+  };
 }
 
 /** step 里声明的全部接口引用：wait、assert、capture，按 path+nav+call_index 去重。 */
@@ -65,94 +95,6 @@ export function toReportApi(record: RequestRecord): ReportStepApi {
   };
 }
 
-/** 解析 body → jsonPath 取值。返回 { ok, parsed, actual, diagnostic }：
- *  body 缺失/非 JSON → BODY_UNAVAILABLE；path 命中 → ok；未命中 → missing + evidence。
- */
-interface ResolveResult {
-  ok: boolean;
-  actual?: unknown;
-  diagnostic?: Record<string, unknown>;
-}
-
-function resolveValue(body: string | undefined, path: string): ResolveResult {
-  if (body === undefined) {
-    return { ok: false, diagnostic: { path_status: 'BODY_UNAVAILABLE', reason: 'no_body' } };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return { ok: false, diagnostic: { path_status: 'BODY_UNAVAILABLE', reason: 'non_json' } };
-  }
-  const actual = jsonPath(parsed, path);
-  if (actual === undefined) {
-    return { ok: false, diagnostic: diagnoseMissingPath(parsed, path) };
-  }
-  return { ok: true, actual };
-}
-
-/** query 断言报告取值：完整键名 → 有序 string[]；缺失给 missing 诊断。 */
-function resolveQuery(url: string | undefined, key: string): ResolveResult {
-  if (!url) return { ok: false, diagnostic: { path_status: 'missing', resolved_prefix: '' } };
-  const values = queryParamValues(url, key);
-  if (values === undefined) return { ok: false, diagnostic: { path_status: 'missing', resolved_prefix: '' } };
-  return { ok: true, actual: values.map((value) => redactText(value)) };
-}
-
-/** 按声明把 checks 展开成报告断言：每条 expect 一条，actual 从真实响应体解析。 */
-export function collectAssertions(step: Step, passed: boolean, records: RequestRecord[]): Record<string, unknown>[] {
-  const rows: Record<string, unknown>[] = [];
-  for (const check of step.checks ?? []) {
-    if (!('assert' in check)) continue;
-    const assertion = check.assert;
-    if ('api' in assertion || 'request' in assertion) {
-      const ref = 'api' in assertion ? assertion.api : assertion.request;
-      const record = records.find((r) => r.path === ref.path && r.nav === 'n' + ref.nav && r.call_index === ref.call_index);
-      const isApi = 'api' in assertion;
-      const isQuery = !isApi && assertion.query !== undefined;
-      const entries = (isApi ? assertion.expect : (assertion.query ?? assertion.body)) ?? [];
-      for (const entry of entries) {
-        const bodyStr = isApi ? record?.body : record?.requestBody;
-        const resolved = isApi
-          ? resolveValue(bodyStr, entry.path)
-          : isQuery
-            ? resolveQuery(record?.url, entry.path)
-            : resolveValue(bodyStr, entry.path);
-        rows.push({
-          kind: isApi ? 'api' : 'request',
-          expect: { path: entry.path, op: entry.op, value: 'value' in entry ? entry.value : ('value_ref' in entry ? entry.value_ref : entry.value_from_action) },
-          ...(resolved.ok
-            ? { actual: resolved.actual, path_status: 'ok' }
-            : { actual: null, ...(resolved.diagnostic ?? {}) }),
-          pass: passed,
-        });
-      }
-    } else {
-      rows.push({ kind: Object.keys(assertion)[0] ?? 'assert', expect: assertion, actual: passed ? '通过' : undefined, pass: passed });
-    }
-  }
-  return rows;
-}
-
-export function collectCaptures(step: Step, records: RequestRecord[]): Record<string, unknown>[] {
-  const rows: Record<string, unknown>[] = [];
-  for (const check of step.checks ?? []) {
-    if (!('capture' in check) || !('from_api' in check.capture)) continue;
-    const capture = check.capture;
-    const record = records.find((r) => r.path === capture.from_api.path
-      && r.nav === 'n' + capture.from_api.nav && r.call_index === capture.from_api.call_index);
-    const resolved = resolveValue(record?.body, capture.path);
-    rows.push({
-      as: capture.as,
-      path: capture.path,
-      value: resolved.ok ? resolved.actual : undefined,
-      ...(resolved.ok ? {} : resolved.diagnostic ?? {}),
-      lineage: capture.lineage,
-    });
-  }
-  return rows;
-}
-
 export function buildReportStep(outcome: StepOutcome, index: number): ReportStep & { assertions: Record<string, unknown>[] } {
   const facts: string[] = [];
   for (const api of outcome.apis) {
@@ -168,6 +110,9 @@ export function buildReportStep(outcome: StepOutcome, index: number): ReportStep
     action: outcome.step.intent,
     observation: facts.join('；'),
     duration: `${outcome.durationMs}ms`,
+    ...(outcome.step.report_ref?.group ? { group: outcome.step.report_ref.group } : {}),
+    actionIds: outcome.events?.filter(event => event.type === 'action').map(event => event.id),
+    eventIds: outcome.events?.map(event => event.id),
     apis: outcome.apis,
     assertions: outcome.assertions,
     captures: outcome.captures,
@@ -193,9 +138,11 @@ export function buildReportStep(outcome: StepOutcome, index: number): ReportStep
   };
 }
 
-export function buildReport(ir: IRv2, outcomes: StepOutcome[]): ReportData {
+export function buildReport(ir: IRv2, outcomes: StepOutcome[], options: {
+  run?: ReportRun; acceptance?: AcceptanceSnapshot; events?: ReportEvent[]; images?: ReportImage[];
+} = {}): ReportData {
   const steps = outcomes.map((outcome, index) => buildReportStep(outcome, index + 1));
-  const failed = steps.some((s) => s.status === 'fail');
+  const failed = steps.some((s) => s.status === 'fail') || Boolean(options.run?.errors?.length);
   const blocked = steps.some((s) => s.status === 'blocked');
   const result: ReportData['result'] = failed ? 'FAIL' : blocked || !steps.length ? 'BLOCKED' : 'PASS';
   const totalAssertions = steps.reduce((sum, s) => sum + s.assertions.length, 0);
@@ -210,15 +157,22 @@ export function buildReport(ir: IRv2, outcomes: StepOutcome[]): ReportData {
     steps,
     duration: `${steps.reduce((sum, s) => sum + Number(String(s.duration).replace('ms', '') || 0), 0)}ms`,
     summary,
+    events: options.events ?? outcomes.flatMap(outcome => outcome.events ?? []),
+    images: options.images ?? [],
+    run: { ...(options.run ?? createReplayRun()), status: result },
+    sessionResult: result,
+    recording: { ...ir.provenance },
+    ...(options.acceptance ? { acceptance: options.acceptance } : {}),
   };
-  return {
+  return projectReportFacts({
+    report_schema_version: 2,
     title: ir.name,
     url: ir.url,
-    env: ir.env,
+    env: reportCase.run!.env,
     result,
     summary: reportCase.summary!,
-    sessionId: ir.provenance.session_id,
-    toolVersion: ir.provenance.tool_version,
+    sessionId: reportCase.run!.id,
+    toolVersion: reportCase.run!.toolVersion,
     mocked: ir.provenance.mocked,
     cases: [reportCase],
     coverage: {
@@ -227,5 +181,5 @@ export function buildReport(ir: IRv2, outcomes: StepOutcome[]): ReportData {
       missing: [],
       unplanned: [],
     },
-  };
+  });
 }

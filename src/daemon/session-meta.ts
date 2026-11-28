@@ -43,6 +43,9 @@ export interface SessionMeta {
   browser_endpoint?: string;
   browser_context_id?: string;
   browser_version?: string;
+  cli_sha256?: string;
+  acceptance_sha256?: string;
+  acceptance_frozen_at?: number;
   browser_pid?: number;
   browser_port?: number;
   browser_user_data_dir?: string;

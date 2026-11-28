@@ -9,15 +9,16 @@
 import type { Page, BrowserContext, Dialog } from '@playwright/test';
 import { selectors } from '@playwright/test';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import type { IRv2, Step } from './types.js';
 import { createValueContext, type ValueContext } from './value.js';
 import { executeAction, clearHover, type HoverState } from './actions.js';
 import { executeWaits } from './waits.js';
-import { executeChecks, type AssertionResult } from './checks.js';
+import { executeChecks, notRunChecks, type AssertionResult } from './checks.js';
 import { RequestTracker } from './request-tracker.js';
 import type { RequestRecord } from './request-tracker.js';
-import { buildReport, collectApiRefs, collectCaptures, toReportApi, type StepOutcome } from './report.js';
-import type { ReportData } from './shared/report-render.js';
+import { buildReport, createReplayRun, collectApiRefs, toReportApi, type StepOutcome } from './report.js';
+import type { AcceptanceSnapshot, ReportData, ReportEvent, ReportImage, ReportRun } from './shared/report-model.js';
 import type { InputCommit } from './shared/types.js';
 import { PLAYWRIGHT_VERSION } from './shared/versions.js';
 import { e2etSelectionPoolEngine, E2ET_SELECTION_POOL_ENGINE_NAME } from './shared/selection.js';
@@ -48,6 +49,14 @@ export interface RunnerOptions {
   cdpEndpoint: string;
   /** 回放报告（成功/失败都会回调一次），供 CI reporter 渲染 HTML */
   onReport?: (report: ReportData) => void | Promise<void>;
+  run?: ReportRun;
+  acceptance?: AcceptanceSnapshot;
+}
+
+type EventRecorder = (event: Omit<ReportEvent, 'sequence'>) => ReportEvent;
+
+function errorFact(error: unknown): { message: string } {
+  return { message: error instanceof Error ? error.message : String(error) };
 }
 
 /** 固定选择池 engine 注册（F05/F06 fallback 绑定）：必须在目标 page 创建前注册；
@@ -60,8 +69,16 @@ function ensureSelectionEngineRegistered(): Promise<void> {
 }
 
 export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
-  assertPlaywrightVersion();
-  await ensureSelectionEngineRegistered();
+  const run = { ...(opts.run ?? createReplayRun()), errors: [] as NonNullable<ReportRun['errors']> };
+  const irSha256 = createHash('sha256').update(JSON.stringify(ir, null, 2)).digest('hex');
+  const events: ReportEvent[] = [];
+  const images: ReportImage[] = [];
+  let sequence = 0;
+  const record: EventRecorder = event => {
+    const recorded = { ...event, sequence: sequence++ };
+    events.push(recorded);
+    return recorded;
+  };
   const vctx = createValueContext();
   const reqTracker = new RequestTracker();
   const context = opts.context;
@@ -85,6 +102,8 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
   const outcomes: StepOutcome[] = [];
   let runFailed = false;
   try {
+    assertPlaywrightVersion();
+    await ensureSelectionEngineRegistered();
     await reqTracker.start(context, opts.cdpEndpoint);
     let page = await context.newPage();
     applyNativeTimeouts(page);
@@ -96,9 +115,10 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
       let status: StepOutcome['status'] = 'pass';
       let errorMessage: string | undefined;
       const assertionResults: AssertionResult[] = [];
+      const eventStart = events.length;
       try {
         if (dialogs.failed) throw dialogs.error;
-        const result = await executeStep(page, context, step, vctx, reqTracker, opts.fixtureDir, opts.timeout, hoverState, dialogs, (nextPage) => { page = nextPage; }, assertionResults);
+        const result = await executeStep(page, context, step, vctx, reqTracker, opts.fixtureDir, opts.timeout, hoverState, dialogs, (nextPage) => { page = nextPage; }, assertionResults, `${run.id}:${step.id}`, irSha256, record);
         // action（如 switch_tab）返回新 page 时更新
         if (result.page && result.page !== page) {
           page = result.page;
@@ -116,6 +136,7 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
         .filter((record): record is RequestRecord => record !== undefined);
       let screenshot: string | undefined;
       let screenshotNotice: string | undefined;
+      const screenshotStartedAt = Date.now();
       if (page.isClosed()) {
         screenshotNotice = '截图缺失：页面已关闭';
       } else {
@@ -125,22 +146,35 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
           screenshotNotice = `截图失败：${error instanceof Error ? error.message : String(error)}`;
         }
       }
+      const screenshotEndedAt = Date.now();
+      if (screenshot) {
+        const imageId = `${run.id}:${step.id}:image`;
+        const event = record({
+          id: `${run.id}:${step.id}:screenshot`, type: 'screenshot', kind: 'screenshot', status: 'pass',
+          actionId: `${run.id}:${step.id}`, group: step.report_ref?.group, imageId,
+          executed: true, startedAt: screenshotStartedAt, endedAt: screenshotEndedAt,
+        });
+        images.push({
+          id: imageId, eventId: event.id, actionId: event.actionId, sequence: event.sequence, src: screenshot,
+          phase: assertionResults.some(result => result.executed) ? 'after_checks' : 'after_action', startedAt: screenshotStartedAt, endedAt: screenshotEndedAt,
+        });
+      } else if (screenshotNotice) {
+        record({
+          id: `${run.id}:${step.id}:screenshot`, type: 'screenshot', kind: 'screenshot', status: 'error',
+          actionId: `${run.id}:${step.id}`, group: step.report_ref?.group,
+          executed: !page.isClosed(), error: { message: screenshotNotice },
+          ...(page.isClosed() ? {} : { startedAt: screenshotStartedAt, endedAt: screenshotEndedAt }),
+        });
+      }
       outcomes.push({
         step,
         status,
         durationMs: Date.now() - startedAt,
         error: errorMessage,
         apis: records.map(toReportApi),
-        assertions: assertionResults.length
-          ? assertionResults as unknown as Record<string, unknown>[]
-          : (step.checks ?? []).filter((c) => 'assert' in c).map((c) => ({
-            kind: 'assert' in c ? Object.keys(c.assert)[0] ?? 'assert' : 'assert',
-            expect: 'assert' in c ? c.assert : undefined,
-            actual: null,
-            pass: false,
-            executed: false,
-          })),
-        captures: collectCaptures(step, records),
+        assertions: assertionResults.filter(result => result.type !== 'capture') as unknown as Record<string, unknown>[],
+        captures: assertionResults.filter(result => result.type === 'capture') as unknown as Record<string, unknown>[],
+        events: events.slice(eventStart),
         ...(screenshot ? { screenshot } : {}),
         ...(screenshotNotice ? { screenshotNotice } : {}),
       });
@@ -165,6 +199,8 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
     console.log('✅ IR 测试全部通过');
   } catch (error) {
     runFailed = true;
+    run.errors.push(errorFact(error));
+    record({ id: `${run.id}:runtime-error`, type: 'error', kind: 'runtime', status: 'error', error: errorFact(error) });
     throw error;
   } finally {
     const cleanupErrors: unknown[] = [];
@@ -173,8 +209,36 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
     while (dialogs.pending.size) await Promise.all(dialogs.pending);
     context.off('dialog', onDialog);
     if (dialogs.failed) cleanupErrors.push(dialogs.error);
+    for (const error of cleanupErrors) {
+      run.errors.push(errorFact(error));
+      record({ id: `${run.id}:cleanup:${sequence}`, type: 'error', kind: 'cleanup', status: 'error', error: errorFact(error) });
+    }
+    for (const step of ir.steps.slice(outcomes.length)) {
+      outcomes.push({ step, status: 'blocked', durationMs: 0, apis: [], assertions: [], captures: [] });
+    }
+    for (const outcome of outcomes.filter(outcome => outcome.status === 'blocked' && !outcome.events?.length)) {
+      const step = outcome.step;
+      const actionId = `${run.id}:${step.id}`;
+      const eventStart = events.length;
+      record({
+        id: actionId, type: 'action', kind: step.action, status: 'not_run', executed: false,
+        group: step.report_ref?.group, actionId, intent: step.intent, args: step.args,
+        valueSource: step.value, actualStatus: 'not_collected',
+      });
+      const checks = notRunChecks(step.checks ?? []);
+      for (const result of checks) record({
+        id: `${actionId}:check:${result.checkIndex}:${result.entryIndex}`,
+        type: result.type ?? 'assert', kind: result.kind, status: 'not_run', executed: false,
+        actionId, checkId: result.checkId, group: result.group ?? step.report_ref?.group, expect: result.expect,
+        actualStatus: 'not_collected', evidence: { irRef: { irSha256, stepId: step.id, checkIndex: result.checkIndex, entryIndex: result.entryIndex } },
+      });
+      outcome.assertions = checks.filter(result => result.type !== 'capture') as unknown as Record<string, unknown>[];
+      outcome.captures = checks.filter(result => result.type === 'capture') as unknown as Record<string, unknown>[];
+      outcome.events = events.slice(eventStart);
+    }
+    run.endedAt = Date.now();
     try {
-      await opts.onReport?.(buildReport(ir, outcomes));
+      await opts.onReport?.(buildReport(ir, outcomes, { run, acceptance: opts.acceptance, events, images }));
     } catch (error) {
       console.error('❌ 回放报告生成失败:', error);
     }
@@ -203,6 +267,9 @@ async function executeStep(
   dialogs: DialogState,
   setPage: (page: Page) => void,
   assertionResults: AssertionResult[],
+  actionId: string,
+  irSha256: string,
+  record: EventRecorder,
 ): Promise<{ page?: Page }> {
   console.log(`\n⏳ 步骤: ${step.id} - ${step.intent} (${step.action})`);
 
@@ -216,11 +283,36 @@ async function executeStep(
   let actionFailed = false;
   const inputCommits: InputCommit[] = [];
   const recordInput = (commit: InputCommit): void => { inputCommits.push(commit); };
+  let observationIndex = 0;
   let stepFailed = false;
+  let waitRecorded = false;
+  let commitsStarted = 0;
+  const action = record({
+    id: actionId, type: 'action', kind: step.action, status: 'error', executed: true,
+    group: step.report_ref?.group, actionId, intent: step.intent, args: step.args, frame: step.frame,
+    valueSource: step.value, actualStatus: 'not_collected', startedAt: Date.now(),
+  });
   try {
     try {
       reqTracker.beginConsoleAction(step.id);
-      result = await executeAction(page, context, step, vctx, reqTracker, fixtureDir, hoverState, recordInput);
+      try {
+        result = await executeAction(page, context, step, vctx, reqTracker, fixtureDir, hoverState, recordInput, fact => {
+          Object.assign(action, fact);
+          record({
+            id: `${actionId}:observation:${Date.now()}:${observationIndex++}`, type: 'observation',
+            kind: fact.input !== undefined ? 'action_input' : 'target', status: 'pass', executed: true,
+            group: step.report_ref?.group, actionId, ...fact,
+          });
+        });
+        action.status = 'pass';
+        if (result.resolvedValue !== undefined || result.outputValue !== undefined) {
+          action.actual = { resolvedValue: result.resolvedValue, outputValue: result.outputValue };
+          action.actualStatus = 'present';
+        }
+      } catch (error) {
+        action.error = errorFact(error);
+        throw error;
+      } finally { action.endedAt = Date.now(); }
       currentPage = result.page ?? page;
       setPage(currentPage);
       if (result.page && result.page !== page) {
@@ -232,7 +324,16 @@ async function executeStep(
       deadline = Date.now() + budget;
 
       if (step.wait?.length) {
-        await executeWaits(currentPage, step.wait, reqTracker, Math.max(0, deadline - Date.now()), step.frame);
+        waitRecorded = true;
+        const wait = record({
+          id: `${actionId}:wait`, type: 'observation', kind: 'wait', status: 'error', executed: true,
+          group: step.report_ref?.group, actionId, args: step.wait, frame: step.frame, startedAt: Date.now(),
+        });
+        try {
+          await executeWaits(currentPage, step.wait, reqTracker, Math.max(0, deadline - Date.now()), step.frame);
+          wait.status = 'pass';
+        } catch (error) { wait.error = errorFact(error); throw error; }
+        finally { wait.endedAt = Date.now(); }
       }
     } catch (error) {
       actionFailed = true;
@@ -241,12 +342,41 @@ async function executeStep(
       if (dialogs.current === policy) dialogs.current = undefined;
       while (policy.pending.size) await Promise.all(policy.pending);
       if (policy.failed) {
+        record({ id: `${actionId}:dialog`, type: 'error', kind: 'dialog', status: 'error', actionId, group: step.report_ref?.group, error: errorFact(policy.error) });
         if (!actionFailed) throw policy.error;
         console.error('❌ dialog handling:', policy.error);
       }
     }
 
-    for (const commit of inputCommits) await commit.verify();
+    for (const [index, commit] of inputCommits.entries()) {
+      commitsStarted++;
+      const event = record({
+        id: `${actionId}:input_commit:${index}`, type: 'observation', kind: 'input_commit', status: 'error',
+        actionId, group: step.report_ref?.group, executed: true, startedAt: Date.now(), actualStatus: 'unavailable',
+      });
+      try {
+        const evidence = await commit.verify();
+        event.status = 'pass';
+        event.target = evidence.target;
+        event.resolvedExpected = evidence.expected;
+        event.actual = evidence.actual;
+        event.actualStatus = 'present';
+        event.evidence = { ...evidence, phase: 'after-wait' };
+      } catch (error) {
+        event.error = errorFact(error);
+        const encoded = event.error.message.match(/^FILL_NOT_COMMITTED: (\{.*\})$/s)?.[1];
+        if (encoded) {
+          try {
+            const evidence = JSON.parse(encoded) as { expected?: unknown; actual?: unknown; target?: unknown };
+            event.evidence = evidence;
+            event.target = evidence.target;
+            event.resolvedExpected = evidence.expected;
+            if (Object.hasOwn(evidence, 'actual')) { event.actual = evidence.actual; event.actualStatus = 'present'; }
+          } catch {}
+        }
+        throw error;
+      } finally { event.endedAt = Date.now(); }
+    }
     reqTracker.finishConsoleAction(step.id);
 
     // wait 与输入校验成功后：登记历史动作值 → save_as → checks
@@ -274,9 +404,32 @@ async function executeStep(
     stepFailed = true;
     throw error;
   } finally {
+    if (step.wait?.length && !waitRecorded) record({
+      id: `${actionId}:wait`, type: 'observation', kind: 'wait', status: 'not_run', executed: false,
+      actionId, group: step.report_ref?.group, args: step.wait, frame: step.frame, actualStatus: 'not_collected',
+    });
+    for (let index = commitsStarted; index < inputCommits.length; index++) record({
+      id: `${actionId}:input_commit:${index}`, type: 'observation', kind: 'input_commit', status: 'not_run',
+      actionId, group: step.report_ref?.group, executed: false, actualStatus: 'not_collected',
+    });
+    if (!assertionResults.length) assertionResults.push(...notRunChecks(step.checks ?? []));
+    for (const result of assertionResults) {
+      record({
+        id: `${actionId}:check:${result.checkIndex}:${result.entryIndex}`,
+        type: result.type ?? 'assert', kind: result.kind, status: result.status ?? 'not_run',
+        actionId, checkId: result.checkId, group: result.group ?? step.report_ref?.group,
+        startedAt: result.startedAt, endedAt: result.endedAt, executed: result.executed,
+        expect: result.expect, resolvedExpected: result.resolvedExpected, actual: result.actual,
+        actualStatus: result.actualStatus, target: result.target, frame: result.frame, error: result.error,
+        evidence: { ...(result.evidence as object ?? {}), irRef: { irSha256, stepId: step.id, checkIndex: result.checkIndex, entryIndex: result.entryIndex } },
+      });
+    }
     const cleanupErrors: unknown[] = [];
-    for (const commit of inputCommits) {
-      try { await commit.dispose(); } catch (error) { cleanupErrors.push(error); }
+    for (const [index, commit] of inputCommits.entries()) {
+      try { await commit.dispose(); } catch (error) {
+        cleanupErrors.push(error);
+        record({ id: `${actionId}:input_cleanup:${index}`, type: 'error', kind: 'input_cleanup', status: 'error', actionId, group: step.report_ref?.group, error: errorFact(error) });
+      }
     }
     if (cleanupErrors.length) {
       if (!stepFailed) throw cleanupErrors[0];

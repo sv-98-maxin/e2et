@@ -6,7 +6,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { targetToLocator, settledToWait, parseFrame } from './build.js';
+import { targetToLocator, settledToWait, parseFrame, recordedReportRef } from './build.js';
 import { candidateToLocator } from '../shared/wait-locator.js';
 import { parseIRv2, ValueSchema, type IRv2, type Step, type Assert, type ExpectEntry } from './schema.js';
 import { isValidTemplate } from '../value-template.js';
@@ -84,6 +84,7 @@ export function checkIr(input: unknown, opts: CheckOptions = {}): CheckResult {
     }
   }
   if (trace && trace.session?.schema_version !== TRACE_SCHEMA_VERSION) failures.push({ rule: 'trace-version', message: `trace schema_version 必须是 ${TRACE_SCHEMA_VERSION}` });
+  if (!trace) skipped.push('trace-absent: 跳过 report-metadata 报告引用元数据核对');
 
   const reqByNav = new Map<string, RequestEvent[]>();
   if (trace) {
@@ -107,12 +108,21 @@ export function checkIr(input: unknown, opts: CheckOptions = {}): CheckResult {
     skipped.push('trace-absent: 跳过 provenance 来源核对');
   }
 
+  const checkReportRef = (ref: Step['report_ref'], recorded: Step['report_ref'], step: Step, where: string): void => {
+    for (const field of ['group', 'source_event_id', 'check_id'] as const) {
+      if (ref?.[field] !== undefined && ref[field] !== recorded?.[field]) {
+        failures.push({ rule: 'report-metadata', step: step.id, message: `${where}.report_ref.${field} 与 trace 不一致（IR=${JSON.stringify(ref[field])} vs trace=${JSON.stringify(recorded?.[field])}）` });
+      }
+    }
+  };
+
   // ── 道 2：Locator 可达性（trace 存在时校验主定位 matches==1）──
   if (trace) {
     for (const s of ir.steps) {
-      if (!trace.actions.some((action) => action.id === s.trace_ref)) failures.push({ rule: 'trace-evidence', step: s.id, message: `trace_ref ${s.trace_ref} 在 trace 中不存在` });
-      if (!s.locator && !s.fallback?.length) continue;
       const action = trace.actions.find((a) => a.id === s.trace_ref);
+      if (!action) failures.push({ rule: 'trace-evidence', step: s.id, message: `trace_ref ${s.trace_ref} 在 trace 中不存在` });
+      checkReportRef(s.report_ref, action ? recordedReportRef(action) : undefined, s, 'step');
+      if (!s.locator && !s.fallback?.length) continue;
       if (!action?.target?.candidates?.length) {
         failures.push({ rule: 'locator-reachable', step: s.id, message: '缺少对应 action 的候选定位证据' });
         continue;
@@ -372,6 +382,7 @@ export function checkIr(input: unknown, opts: CheckOptions = {}): CheckResult {
       for (let i = 0; i < evs.length; i++) {
         const ev = evs[i];
         const c = checks[i];
+        checkReportRef(c.report_ref, recordedReportRef(ev), s, `checks[${i}]`);
         if (ev.t === 'assert') {
           if (!('assert' in c)) {
             failures.push({ rule: 'checks-mapping', step: s.id, message: `checks[${i}] 是 capture，trace 事件是 assert（错序/类型不符）` });

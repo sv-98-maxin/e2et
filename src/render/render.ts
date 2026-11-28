@@ -43,6 +43,8 @@ import * as path from 'node:path';
 import { runTest, type RunnerOptions } from '../runtime/runner';
 import { withReplayContext } from '../runtime/replay-context';
 import type { IRv2 } from '../runtime/types';
+import { createReplayRun, runtimeDigest } from '../runtime/report';
+import type { AcceptanceSnapshot, ReportRun } from '../runtime/shared/report-model';
 
 const PAGE_URL = ${JSON.stringify(ir.url)};
 const COVERED_PAGES: string[] = [${coveredPages}];
@@ -55,18 +57,32 @@ ${hasBudget ? `    test.setTimeout(${replayTimeoutMs(ir.steps)});
 ` : ''}    // 回放环境来自本次参数/环境输入；IR provenance 不参与选择。
     await withReplayContext(
       async (context, cdpEndpoint, replayEnvironment) => {
+        const metadata = testInfo.project.metadata;
+        const run = createReplayRun({
+          ...(metadata.e2et_run as Partial<ReportRun> | undefined),
+          id: process.env.E2ET_RUN_ID ?? testInfo.testId + ':retry:' + testInfo.retry,
+          toolVersion: typeof metadata.e2et_version === 'string' ? metadata.e2et_version : '',
+          env: process.env.E2ET_RUN_ENV ?? process.env.TEST_ENV ?? 'default',
+          runtimeSha256: runtimeDigest(path.resolve(path.dirname(testInfo.file), '../runtime')),
+          authSource: replayEnvironment.auth_source,
+          browserSource: replayEnvironment.browser_source,
+          browserVersion: context.browser()?.version(),
+        });
         await testInfo.attach('replay-environment', {
           body: JSON.stringify(replayEnvironment),
           contentType: 'application/json',
         });
         await testInfo.attach('runtime-environment', {
-          body: JSON.stringify(testInfo.project.metadata),
+          body: JSON.stringify(run),
           contentType: 'application/json',
         });
         await runTest(ir, {
           fixtureDir: path.dirname(test.info().file) + '${fixtureRel}',
           context,
           cdpEndpoint,
+          run,
+          acceptance: metadata.e2et_run?.id === run.id && process.env.E2ET_RUN_ACCEPTANCE_DIR
+            ? metadata.e2et_acceptance as AcceptanceSnapshot | undefined : undefined,
           onReport: (report) => testInfo.attach('ir-report', {
             body: JSON.stringify(report),
             contentType: 'application/json',

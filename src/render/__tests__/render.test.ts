@@ -69,7 +69,7 @@ describe('renderIR', () => {
     expect(out).toContain("import { test, expect } from '@playwright/test';");
     expect(out).toContain("import { runTest, type RunnerOptions } from '../runtime/runner';");
     expect(out).toContain("import { withReplayContext } from '../runtime/replay-context';");
-    // P4：生成代码不再猜本机身份（删 fs/os 导入与 existsSync 列表；path 仅用于 fixture 路径）
+    // P4：生成代码不再猜本机身份；path 用于 fixture 与实际 runtime 目录
     expect(out).not.toContain("import * as fs from 'node:fs';");
     expect(out).not.toContain("import * as os from 'node:os';");
     expect(out).not.toContain('existsSync');
@@ -82,7 +82,10 @@ describe('renderIR', () => {
     // 编译环境不进产物：版本号写死会让每次发版都改字节，报告用 runtime-environment 记执行期事实
     expect(out).not.toContain('compile-environment');
     expect(out).toContain("testInfo.attach('runtime-environment'");
-    expect(out).toContain('body: JSON.stringify(testInfo.project.metadata)');
+    expect(out).toContain('const metadata = testInfo.project.metadata;');
+    expect(out).toContain('const run = createReplayRun({');
+    expect(out).toContain("import { createReplayRun, runtimeDigest } from '../runtime/report';");
+    expect(out).toContain("runtimeSha256: runtimeDigest(path.resolve(path.dirname(testInfo.file), '../runtime'))");
     expect(out).toContain('await runTest(ir, {');
     expect(out).toContain('test.describe("render-case"');
     expect(out).toContain('test("render-case E2E"');

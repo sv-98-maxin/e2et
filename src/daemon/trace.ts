@@ -124,9 +124,10 @@ function projectTraceEvent(event: Record<string, unknown>): Record<string, unkno
 }
 const EMPTY_SET = new Set<string>();
 const CONTRACT_KEYS_BY_TYPE: Record<string, ReadonlySet<string>> = {
-  action: new Set(['t','id','ts','ts_end','kind','intent','nav','args','value','save_as','creates','target','frame','settled_by','requests','result','execute_result','resolved_tab','replayable','resolved_value','output_value','saved_value','source_action']),
-  assert: new Set(['t','id','ts','after','kind','expect','actual','pass','evidence','target','within','value','read_mode','observation_ref','replayable','frame']),
-  capture: new Set(['t','id','ts','after','from','as','value','path','lineage','target','read_mode','replayable','result','frame']),
+  action: new Set(['t','id','ts','ts_end','kind','intent','group','nav','args','value','save_as','creates','target','frame','settled_by','requests','result','execute_result','resolved_tab','replayable','resolved_value','output_value','saved_value','source_action']),
+  assert: new Set(['t','id','ts','ts_end','after','kind','group','check_id','expect','actual','pass','status','executed','evidence','target','within','value','read_mode','observation_ref','replayable','frame']),
+  capture: new Set(['t','id','ts','ts_end','after','group','from','as','value','path','lineage','target','read_mode','replayable','result','frame']),
+  session: new Set(['t','id','ts','schema_version','session_id','env','tool_version','cli_sha256','acceptance_sha256','acceptance_frozen_at','browser','viewport','transport','auth_source','browser_source','browser_context_id']),
   inspect: new Set(['t','id','ts','after','group','check','within','frame','total','truncated','candidates','context']),
   observation: new Set(['t','id','ts','after','source','target_id','document','nav','origin','result','replayable','group']),
   request: new Set(['t','id','ts','path','nav','call_index','url_redacted','triggered_by','target_id','creates','req_body_ref','resp_body_ref','req_body_omitted','resp_body_omitted','req_body_redacted_paths','resp_body_redacted_paths']),
@@ -296,6 +297,9 @@ export interface SessionTraceFields {
   session_id: string;
   env: string;
   tool_version: string;
+  cli_sha256?: string;
+  acceptance_sha256?: string;
+  acceptance_frozen_at?: number;
   browser_version?: string;
   headless?: boolean;
   transport?: string;
@@ -315,6 +319,8 @@ export function writeSessionStart(f: SessionTraceFields): void {
     session_id: f.session_id,
     env: f.env,
     tool_version: f.tool_version,
+    ...(f.cli_sha256 ? { cli_sha256: f.cli_sha256 } : {}),
+    ...(f.acceptance_sha256 ? { acceptance_sha256: f.acceptance_sha256, acceptance_frozen_at: f.acceptance_frozen_at } : {}),
     ...(f.browser_version ? { browser: { version: f.browser_version, ...(f.headless !== undefined ? { headless: f.headless } : {}) } } : {}),
     ...(f.viewport ? { viewport: f.viewport } : {}),
     ...(f.transport ? { transport: f.transport } : {}),

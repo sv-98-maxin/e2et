@@ -6,12 +6,13 @@ IR 是从真实录制生成的中间测试表示。仅在需要复用场景时�
 
 ```bash
 e2et case list
-e2et case run '<name>' --auth imported --browser managed --auth-state '<state>'
+e2et case run '<name>' --auth imported --browser managed --auth-state '<state>' [--acceptance '<acceptance-file>']
 ```
 
 - list 返回 data.cases/data.invalid。选候选后读实际 IR steps、inputs、waits、checks；名称、同 URL 或历史 PASS 不证明覆盖本次要求。
 - 回放完整执行保存的测试原字节，不从旧 trace 重编译；不要裁剪步骤或改生成文件。
 - 本次身份与页面操作次数/写授权适用于全部 steps。给定 state 用 imported+managed；已有准备身份可 auto。回放不沿用录制 provenance 里的身份，不在失败后换账号。
+- 需要验收输入时先核对应 commands 支持 `--acceptance`，按 [acceptance.md](acceptance.md#执行前的验收说明) 在运行前准备独立预期；校验冻结和内部环境传递由 CLI 管理，无输入不补造。
 
 ## Source → IR → 保存
 
@@ -21,12 +22,12 @@ Source 指实时录制会话。先正常 stop 并生成原生报告；仅 stop.r
 e2et ir build -s '<sid>' --name '<name>'
 e2et ir check '<ir-file>' --trace '<sid>'
 e2et judge '<ir-file>'
-e2et land '<ir-file>' --auth imported --browser managed --auth-state '<state>'
+e2et land '<ir-file>' --auth imported --browser managed --auth-state '<state>' [--acceptance '<acceptance-file>']
 ```
 
 - ir build 返回 data.ir_path、unmapped_actions、dropped_steps、warnings。保留不能映射/丢弃事实，不删 trace 或手改 IR 来过校验。
 - ir check 看 data.passed；judge 看 data.regressible。两者核技术证据，不定义业务覆盖。
-- page execute 不是可映射 Source 动作；用过 mock add 的会话不能落库。
+- page execute 的脚本事实可在 Source 报告阅读，仍不是可映射动作，judge 的 UNMAPPED_ACTIONS 拒绝不变；不删 trace 规避，仅报告收尾不要求新开会话。用过 mock add 的会话不能落库。
 - **land 会真实回放一次，成功后才原子写个人库**。verify 默认也回放，case run 又执行一次；不要习惯性全部串跑。若次数或步骤超授权，先说明冲突，不额外执行。
 - 用户要求保存且步骤在授权内时可直接 land；要求“保存后再回放”才在成功后 case run。已有同名默认拒绝，force 需明确同名替换授权；失败保留旧用例。
 
@@ -39,10 +40,10 @@ e2et land '<ir-file>' --auth imported --browser managed --auth-state '<state>'
 | land | data.status=landed 且 data.verification.status=passed | **data.verification.run_dir、data.verification.report** |
 | render | data.status=compiled 且 data.replay=not_run | 无回放证据 |
 
-- verify 的 skip-test 返回 data.status=skipped，跳过回放，不是 passed。失败返回 ok=false/error，不假设存在 data.run_dir/report；TEST_FAILED 时从原始 error.hint 获取已保留的证据目录，不为找路径重跑。
-- 回放 report.json 是 Playwright 原始 JSON（config/suites/errors/stats），不是 Source ReportData。按实际返回路径读最终 test result 的 ir-report 附件：内联 body 为 base64，附件给 path 时读取该文件。
-- 解码后的 ReportData 须 result=PASS，且 cases/steps/assertions 对应实际执行；缺附件、未执行、跳过或失败都不算回放通过。
-- report.html 返回的是 html-report 目录，其入口为 index.html。land 的这两个路径在 verification.report 下，不能误读顶层 data.report。
+- verify 的 skip-test 返回 data.status=skipped，只证明未跑，验收为 BLOCKED/not_run。失败返回 ok=false/error，不假设还有成功 data；有 error.evidence 时读取其中实际存在的 run_dir/report 路径，不为找路径重放页面写。
+- 回放 report 对象中 `json` 是 PW 原始 `report.json`（config/suites/errors/stats），`facts_json` 是最终 `report-data.json`，`html` 是新自包含 `report.html`，`playwright_html` 保留原生 `html-report/index.html` 详情。路径以实际返回且存在的文件为准；land 从 verification.report 读取。
+- 最终 facts_json 的 ReportData 须 result=PASS，本次 run、events/images 与检查证据对应实际执行，同时核 PW 最终 test result 和 errors。ir-report 附件只是中间事实：内联 body 为 base64，path 指向实际文件；它不能盖过最终 failed/timedOut/interrupted、非 0 进程或清理错误，这些保留 FAIL。
+- 无失败但 skipped/0 tests、PW passed 却缺少或损坏 ir-report 附件时为 BLOCKED；缺最终 facts_json 也不能判 PASS，不补造动作、实测或截图，不改原报告或借回放重复提交。
 
 ## 只重编译
 

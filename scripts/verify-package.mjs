@@ -27,6 +27,32 @@ const privateDir = path.join(artifacts, 'private');
 const prefix = path.join(privateDir, 'prefix');
 const workRoot = path.join(artifacts, 'work-root');
 const state = path.join(privateDir, 'state.json');
+const planFile = path.join(artifacts, 'plan.json');
+const acceptanceFile = path.join(artifacts, 'acceptance.json');
+const acceptanceDocument = { schemaVersion: 1, scenarios: [
+  { id: 'click', goal: '一次可信点击产生精确请求', source: { kind: 'contract', text: 'loopback 可信点击合同' },
+    preconditions: ['新页面点击计数为 0，尚无可信点击'], checks: [
+      { id: 'click-before', expectation: '点击0;trusted:false' },
+      { id: 'click-after', expectation: '点击1;trusted:true' },
+      { id: 'request-id', expectation: '请求 body.id 为 beta-click' },
+      { id: 'request-count', expectation: '请求 body.count 为 1' },
+      { id: 'request-trusted', expectation: '请求 body.trusted 为 true' },
+    ] },
+  { id: 'native', goal: '名称与描述使用本次动态输入', source: { kind: 'contract', text: 'loopback 原生输入合同' },
+    preconditions: ['新页面商品名称为空'], checks: [
+      { id: 'native-empty', expectation: '商品名称初始为空' },
+      { id: 'native-name', expectation: '商品名称等于本次生成动作的值' },
+      { id: 'native-description', expectation: '工具描述等于本次 pkgName 的值' },
+    ] },
+  { id: 'aria', goal: '只改变目标选择池并消费本次动态选项名', source: { kind: 'contract', text: 'loopback 标准 ARIA 合同' },
+    preconditions: ['主池与竞争池均未选择'], checks: [
+      { id: 'aria-empty', expectation: '主池初始未选择' },
+      { id: 'aria-selected', expectation: '主池选择蔬菜' },
+      { id: 'aria-competing-pool', expectation: '竞争池仍未选择' },
+      { id: 'aria-dynamic-assert', expectation: '动态选项状态等于本次选择动作的值' },
+    ] },
+] };
+const acceptanceBytes = Buffer.from(JSON.stringify(acceptanceDocument, null, 2));
 const caseName = `pkg_${randomUUID().replaceAll('-', '')}`;
 const caseRoot = path.join(defaultRoot, 'library', caseName);
 const cli = path.join(prefix, 'bin', 'e2et');
@@ -35,11 +61,11 @@ const sourceCli = path.join(root, 'dist', 'cli.js');
 const cleanEnv = { ...process.env };
 for (const key of Object.keys(cleanEnv)) {
   if (/^(E2ET_|WDK_|PLAYWRIGHT_|CHROME_|PUPPETEER_|BROWSER_|CDP_)/.test(key)
-    || ['HEADLESS', 'AUTH_STATE', 'USER_DATA_DIR', 'NODE_OPTIONS', 'NODE_PATH', 'NODE_TLS_REJECT_UNAUTHORIZED'].includes(key)) delete cleanEnv[key];
+    || ['HEADLESS', 'AUTH_STATE', 'USER_DATA_DIR', 'NODE_OPTIONS', 'NODE_PATH', 'NODE_TLS_REJECT_UNAUTHORIZED', 'TEST_ENV'].includes(key)) delete cleanEnv[key];
 }
 const env = { ...cleanEnv, E2ET_HOME: workRoot, E2ET_AUTH_STATE: state, E2ET_MANAGED_HEADLESS: 'true', HEADLESS: 'true' };
 const receipt = { status: 'running', package: expectedPackage.name, version: expectedPackage.version, tarball, artifacts, case: caseName,
-  work_root: workRoot, default_work_root: defaultRoot, input_state_format: 'empty_standard_storage_state', commands: [], reports: [], http_observations: [], cleanup: [] };
+  work_root: workRoot, default_work_root: defaultRoot, input_state_format: 'empty_standard_storage_state', commands: [], startups: [], reports: [], http_observations: [], cleanup: [] };
 const sessions = new Set();
 let fixture;
 let origin;
@@ -47,12 +73,17 @@ let savedManifest;
 let ir;
 let irFile;
 let irSha;
+const replayNames = new Set();
+const replayOptions = new Set();
 let defaultOutputOwned = false;
 const defaultOutput = path.join(defaultRoot, 'workspace', 'verify', `${caseName}-default`);
 fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(path.join(artifacts, 'commands'));
 fs.mkdirSync(path.join(artifacts, 'observations'));
 fs.writeFileSync(state, '{"cookies":[],"origins":[]}', { mode: 0o600, flag: 'wx' });
+fs.writeFileSync(planFile, '["click","native","aria"]', { mode: 0o600, flag: 'wx' });
+fs.writeFileSync(acceptanceFile, acceptanceBytes, { mode: 0o600, flag: 'wx' });
+fs.writeFileSync(path.join(artifacts, 'acceptance-v1.json'), acceptanceBytes, { mode: 0o600, flag: 'wx' });
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const fileSha = file => sha(fs.readFileSync(file));
@@ -107,7 +138,39 @@ async function invoke(label, args, options = {}) {
   assert.equal(result.code, options.code ?? 0, `${label}: ${result.stdout}\n${result.stderr}`);
   assert.equal(json.ok, (options.code ?? 0) === 0, `${label}: bad envelope`);
   if (options.error) assert.equal(json.error?.code, options.error, `${label}: wrong error`);
-  if (args[0] === 'assert') assert.equal(json.data?.pass, options.pass ?? true, `${label}: assertion did not pass`);
+  if (json.ok && args[0] === 'assert') assert.equal(json.data?.pass, options.pass ?? true, `${label}: assertion did not pass`);
+  if (json.ok && args[0] === 'session' && args[1] === 'start') {
+    const sid = json.data.session_id;
+    sessions.add(sid);
+    const metaFile = path.join(workRoot, 'sessions', `${sid}.json`);
+    const traceFile = path.join(workRoot, 'workspace', 'traces', sid, 'trace.jsonl');
+    const meta = readJson(metaFile);
+    const startup = JSON.parse(fs.readFileSync(traceFile, 'utf8').split('\n').find(line => line.trim()));
+    assert.equal(meta.id, sid);
+    assert.equal(startup.t, 'session');
+    assert.equal(startup.session_id, sid);
+    assert.equal(meta.cli_sha256, receipt.installed.cli_sha256, 'Managed bootstrap lost the startup CLI hash');
+    assert.equal(startup.cli_sha256, receipt.installed.cli_sha256, 'Trace startup lost the actual CLI hash');
+    const acceptanceIndex = args.indexOf('--acceptance');
+    let frozenFile;
+    if (acceptanceIndex >= 0) {
+      frozenFile = path.join(path.dirname(traceFile), 'acceptance.json');
+      const frozen = readJson(path.join(path.dirname(traceFile), 'acceptance-meta.json'));
+      assert.equal(fileSha(frozenFile), fileSha(args[acceptanceIndex + 1]), 'Startup acceptance bytes changed');
+      assert.equal(frozen.sha256, fileSha(frozenFile));
+      assert(Number.isFinite(frozen.frozenAt) && frozen.frozenAt > 0);
+      for (const original of [meta, startup]) {
+        assert.equal(original.acceptance_sha256, frozen.sha256, 'Managed bootstrap lost the frozen acceptance hash');
+        assert.equal(original.acceptance_frozen_at, frozen.frozenAt, 'Managed bootstrap lost the acceptance freeze time');
+      }
+    } else {
+      assert.equal(meta.acceptance_sha256, undefined);
+      assert.equal(startup.acceptance_sha256, undefined);
+    }
+    receipt.startups.push({ session_id: sid, meta: metaFile, trace: traceFile, cli_sha256: startup.cli_sha256,
+      acceptance: frozenFile, acceptance_sha256: startup.acceptance_sha256, acceptance_frozen_at: startup.acceptance_frozen_at });
+    writeReceipt();
+  }
   return json.data ?? json;
 }
 
@@ -167,30 +230,145 @@ function attachment(result, name) {
   const bytes = matches[0].body !== undefined ? Buffer.from(matches[0].body, 'base64') : fs.readFileSync(matches[0].path);
   return JSON.parse(bytes.toString('utf8'));
 }
-function fieldValues(assertions) {
-  return Object.fromEntries(assertions.filter(item => item.kind === 'field_value' && item.expect.value !== '')
-    .map(item => [item.expect.label, item.actual.value]));
+function fieldValues(assertions, mode = 'source') {
+  return Object.fromEntries(assertions.filter(item => item.kind === 'field_value' && item.executed === true && item.actual?.value !== '')
+    .map(item => [mode === 'replay' ? item.expect.field_value.label : item.expect.label, item.actual.value]));
 }
-function nativeReport(runDir, expectedStatus, earlyError) {
-  const jsonFile = path.join(runDir, 'report.json');
+function reportFacts(runDir, paths) {
+  assert.equal(typeof paths.facts_json, 'string', 'CLI did not return final facts_json');
+  assert.equal(path.dirname(paths.facts_json), runDir, 'Final facts do not belong to this run');
+  const bytes = fs.readFileSync(paths.facts_json);
+  const report = JSON.parse(bytes.toString('utf8'));
+  assert.equal(report.report_schema_version, 2);
+  assert.equal(report.cases.length, 1);
+  assert.equal(report.sessionId, path.basename(runDir));
+  assert.equal(report.cases[0].run.id, report.sessionId);
+  assert.equal(report.cases[0].run.mode, 'replay');
+  assert.equal(report.toolVersion, expectedPackage.version);
+  assert.equal(report.cases[0].run.toolVersion, expectedPackage.version);
+  assert(fs.statSync(paths.html).size > 0, 'Missing final report HTML');
+  const archive = path.join(runDir, 'facts', 'report.json');
+  fs.mkdirSync(path.dirname(archive));
+  fs.copyFileSync(paths.facts_json, archive, fs.constants.COPYFILE_EXCL);
+  execFileSync('cmp', [paths.facts_json, archive], { cwd: root });
+  assert.equal(fileSha(archive), sha(bytes), 'Archived final facts changed');
+  const runReceipt = paths.run_receipt ?? path.join(runDir, 'run.json');
+  const run = readJson(runReceipt);
+  assert.equal(run.id, report.sessionId);
+  assert.equal(run.mode, 'replay');
+  assert.equal(run.status, report.cases[0].run.status);
+  assert.equal(run.toolVersion, expectedPackage.version);
+  return { report, evidence: { facts_json: paths.facts_json, facts_archive: archive, facts_sha256: sha(bytes),
+    report_html: paths.html, report_html_sha256: fileSha(paths.html), run_receipt: runReceipt, run_receipt_sha256: fileSha(runReceipt) } };
+}
+function factContract(reportCase) {
+  const events = reportCase.events;
+  const images = reportCase.images;
+  assert(Array.isArray(events) && Array.isArray(images), 'Missing events/images facts');
+  const eventIds = new Map();
+  let previous = -1;
+  for (const event of events) {
+    assert.equal(typeof event.id, 'string');
+    assert(!eventIds.has(event.id), 'Duplicate event ID');
+    assert(Number.isInteger(event.sequence) && event.sequence > previous, 'Unordered event sequence');
+    previous = event.sequence;
+    eventIds.set(event.id, event);
+    if (event.status === 'not_run') {
+      assert.equal(event.executed, false);
+      assert.equal(event.actualStatus, 'not_collected');
+      for (const key of ['actual', 'resolvedExpected', 'startedAt', 'endedAt', 'imageId']) assert(!Object.hasOwn(event, key), `not_run has ${key}`);
+    }
+    if (event.type === 'assert' && reportCase.run.mode === 'replay') {
+      const ref = event.evidence.irRef;
+      assert.equal(ref.irSha256, irSha);
+      const step = ir.steps.find(step => step.id === ref.stepId);
+      const check = step?.checks?.[ref.checkIndex];
+      assert(check?.assert, 'Replay event has no real IR check');
+      assert.equal(event.actionId, `${reportCase.run.id}:${step.id}`);
+      assert.equal(event.group, check.report_ref?.group ?? step.report_ref?.group);
+      assert.equal(event.checkId, check.report_ref?.check_id);
+    }
+  }
+  const imageIds = new Set();
+  for (const image of images) {
+    assert(!imageIds.has(image.id), 'Duplicate image ID');
+    imageIds.add(image.id);
+    const event = eventIds.get(image.eventId);
+    assert.equal(event?.type, 'screenshot', 'Image is not linked to its screenshot event');
+    assert.equal(event.imageId, image.id);
+    assert.equal(image.sequence, event.sequence);
+    assert.equal(image.actionId, event.actionId);
+    screenshot(image.src);
+    if (reportCase.run.mode === 'replay') {
+      assert(['after_action', 'after_checks'].includes(image.phase));
+      const checks = events.filter(event => event.type === 'assert' && event.actionId === image.actionId && event.executed === true);
+      assert.equal(image.phase, checks.length ? 'after_checks' : 'after_action');
+      assert(checks.every(check => check.sequence < image.sequence), 'Completion image precedes its checks');
+    }
+  }
+  for (const event of events) {
+    if (event.actionId) assert.equal(eventIds.get(event.actionId)?.type, 'action', 'Broken action reference');
+    if (event.imageId) assert(imageIds.has(event.imageId), 'Broken image reference');
+    if (event.type === 'action' && event.status === 'not_run') assert(!images.some(image => image.actionId === event.id), 'Unexecuted action borrowed an image');
+  }
+  for (const step of reportCase.steps) {
+    for (const id of step.eventIds ?? []) assert(eventIds.has(id), 'Broken step event reference');
+    for (const id of step.actionIds ?? []) assert.equal(eventIds.get(id)?.type, 'action');
+  }
+}
+function acceptanceContract(reportCase, document = acceptanceDocument) {
+  assert.deepEqual(reportCase.acceptance.document, document);
+  assert.equal(reportCase.acceptance.sha256, sha(Buffer.from(JSON.stringify(document, null, 2))));
+  assert(Number.isFinite(reportCase.acceptance.frozenAt) && reportCase.acceptance.frozenAt > 0);
+  const coverage = reportCase.acceptanceCoverage;
+  const checks = document.scenarios.flatMap(scenario => scenario.checks);
+  assert.equal(coverage.total, checks.length);
+  assert.equal(coverage.bound, checks.length);
+  assert.equal(coverage.result, 'PASS');
+  assert.deepEqual(coverage.scenarios.map(scenario => scenario.id), document.scenarios.map(scenario => scenario.id));
+  for (const scenario of coverage.scenarios) for (const check of scenario.checks) {
+    assert.equal(check.status, 'pass');
+    assert.equal(check.eventIds.length, 1, 'Check must bind exactly one real assertion');
+    const event = reportCase.events.find(event => event.id === check.eventIds[0]);
+    assert.equal(event?.type, 'assert');
+    assert.equal(event.group, scenario.id);
+    assert.equal(event.checkId, check.id);
+    assert.equal(event.status, 'pass');
+    assert.equal(event.executed, true);
+    assert.equal(event.actualStatus, 'present');
+    assert(!event.error);
+  }
+}
+function nativeReport(runDir, paths, expectedStatus, earlyError) {
+  const jsonFile = paths.json;
+  assert.equal(path.dirname(jsonFile), runDir);
   const raw = readJson(jsonFile);
   const tests = realTests(raw.suites);
   assert.equal(tests.length, 1, 'Expected exactly one real test');
   assert.equal(tests[0].results.length, 1, 'Retries/flaky results are not acceptance');
-  const result = tests[0].results[0];
+  const result = tests[0].results.at(-1);
   assert.equal(result.status, expectedStatus);
   assert.equal(raw.stats.skipped, 0);
   assert.equal(raw.stats.flaky, 0);
   assert.equal(raw.stats.expected, expectedStatus === 'passed' ? 1 : 0);
   assert.equal(raw.stats.unexpected, expectedStatus === 'passed' ? 0 : 1);
-  const htmlFile = path.join(runDir, 'html-report', 'index.html');
+  if (expectedStatus === 'passed') {
+    assert.deepEqual(raw.errors ?? [], [], 'Native report has global errors');
+    assert.deepEqual(result.errors, [], 'Final test result has errors');
+  } else assert(result.errors.length > 0, 'Failed test is missing its original errors');
+  const htmlFile = paths.playwright_html;
+  assert.equal(path.dirname(path.dirname(htmlFile)), runDir);
   const html = fs.readFileSync(htmlFile, 'utf8');
   assert(html.includes('playwrightReportBase64'), 'Missing native HTML template');
   const zipData = /data:application\/zip;base64,([A-Za-z0-9+/=]+)/.exec(html);
   assert(zipData, 'Missing embedded report ZIP');
   const zip = Buffer.from(zipData[1], 'base64');
   assert(zip.length > 100 && zip.readUInt32LE(0) === 0x04034b50, 'Invalid embedded report ZIP');
-  const evidence = { run_dir: runDir, status: expectedStatus, json: jsonFile, html: htmlFile,
+  const { report, evidence: facts } = reportFacts(runDir, paths);
+  assert.equal(report.result, expectedStatus === 'passed' ? 'PASS' : 'FAIL');
+  assert.equal(report.cases[0].result, report.result);
+  assert.equal(report.cases[0].run.status, report.result);
+  const evidence = { run_dir: runDir, status: expectedStatus, json: jsonFile, html: htmlFile, ...facts,
     json_sha256: fileSha(jsonFile), html_sha256: fileSha(htmlFile), tests: tests.length };
   receipt.reports.push(evidence);
   if (earlyError) {
@@ -198,22 +376,49 @@ function nativeReport(runDir, expectedStatus, earlyError) {
     writeReceipt();
     return evidence;
   }
-  const report = attachment(result, 'ir-report');
+  const intermediate = attachment(result, 'ir-report');
   const replay = attachment(result, 'replay-environment');
   const runtime = attachment(result, 'runtime-environment');
-  assert.deepEqual(replay, { auth_source: 'imported', browser_source: 'managed' });
-  assert.equal(runtime.e2et_version, expectedPackage.version);
-  assert.equal(runtime.playwright_version, expectedPackage.dependencies['@playwright/test']);
-  assert.equal(report.result, expectedStatus === 'passed' ? 'PASS' : 'FAIL');
-  assert.equal(report.sessionId, ir.provenance.session_id);
+  assert.equal(replay.auth_source, 'imported');
+  assert.equal(replay.browser_source, 'managed');
+  assert.equal(raw.config.metadata.e2et_version, expectedPackage.version);
+  assert.equal(raw.config.metadata.playwright_version, receipt.installed.dependencies['@playwright/test']);
+  assert.equal(runtime.id, path.basename(runDir));
+  assert.equal(runtime.mode, 'replay');
+  assert.equal(runtime.status, 'BLOCKED', 'Startup snapshot is not a final result');
+  assert.equal(runtime.toolVersion, expectedPackage.version);
+  assert.equal(runtime.cliSha256, receipt.installed.cli_sha256);
+  assert.equal(runtime.runtimeSha256, receipt.installed.runtime_digest);
+  assert.equal(runtime.authSource, 'imported');
+  assert.equal(runtime.browserSource, 'managed');
+  assert.equal(runtime.env, 'default');
+  assert.equal(report.sessionId, runtime.id);
+  assert.notEqual(report.sessionId, ir.provenance.session_id);
+  assert.equal(report.cases[0].run.cliSha256, runtime.cliSha256);
+  assert.equal(report.cases[0].run.runtimeSha256, runtime.runtimeSha256);
+  assert.equal(report.cases[0].run.authSource, replay.auth_source);
+  assert.equal(report.cases[0].run.browserSource, replay.browser_source);
+  assert.equal(report.cases[0].run.browserVersion, runtime.browserVersion);
+  assert.match(runtime.browserVersion, /^\d+\./, 'Missing actual browser version');
+  if (replay.browser_version !== undefined) assert.equal(replay.browser_version, runtime.browserVersion);
+  assert.deepEqual(report.cases[0].recording, ir.provenance);
+  assert.equal(intermediate.sessionId, runtime.id);
+  assert.deepEqual(report.cases[0].steps, intermediate.cases[0].steps, 'Final report lost original step facts');
+  assert.deepEqual(report.cases[0].events.slice(0, intermediate.cases[0].events.length), intermediate.cases[0].events, 'Final report lost original events');
+  assert.deepEqual(report.cases[0].images, intermediate.cases[0].images, 'Final report changed original screenshots');
+  for (const error of [...(raw.errors ?? []), ...result.errors]) {
+    assert(report.cases[0].events.some(event => event.error?.message === error.message), 'Final report lost a native execution error');
+  }
   assert.equal(report.mocked, false);
   assert.equal(report.cases.length, 1);
   assert.equal(report.cases[0].name, caseName);
   assert.equal(report.cases[0].result, report.result);
   assert.equal(report.cases[0].steps.length, ir.steps.length);
   const steps = report.cases[0].steps;
+  factContract(report.cases[0]);
   steps.forEach((step, i) => assert.equal(step.action, ir.steps[i].intent));
   if (expectedStatus === 'passed') {
+    acceptanceContract(report.cases[0]);
     steps.forEach((step, i) => {
       assert.equal(step.status, 'pass', `Step ${i + 1} was not executed successfully`);
       assert.equal(step.assertions.length, (ir.steps[i].checks ?? []).filter(check => check.assert).length);
@@ -225,11 +430,34 @@ function nativeReport(runDir, expectedStatus, earlyError) {
     assert.equal(failed?.status, 'fail', 'Wrong step failed');
     assert.match(failed.observation, /OPTION_NOT_FOUND/, 'Wrong ARIA failure');
     screenshot(failed.screenshot);
+    const action = report.cases[0].events.find(event => event.type === 'action' && event.intent === 'ARIA选择蔬菜');
+    assert.equal(action?.status, 'error');
+    assert.equal(action.executed, true);
+    assert.match(action.error.message, /OPTION_NOT_FOUND/);
+    const skipped = report.cases[0].events.filter(event => event.type === 'assert' && event.actionId === action.id);
+    assert(skipped.length > 0, 'Failed selection lost its declared checks');
+    assert(skipped.every(event => event.status === 'not_run' && event.executed === false && event.actualStatus === 'not_collected'));
   }
-  const fields = fieldValues(steps.flatMap(step => step.assertions));
+  const fields = fieldValues(steps.flatMap(step => step.assertions), 'replay');
   if (expectedStatus === 'passed') {
     assert.match(fields['商品名称'], /^pkg-.+/);
     assert.equal(fields['商品名称'], fields['工具描述']);
+    const name = report.cases[0].events.find(event => event.checkId === 'native-name');
+    const description = report.cases[0].events.find(event => event.checkId === 'native-description');
+    assert.equal(name.resolvedExpected, fields['商品名称']);
+    assert.equal(description.resolvedExpected, fields['商品名称']);
+    const option = report.cases[0].events.find(event => event.checkId === 'aria-dynamic-assert');
+    assert.match(option.resolvedExpected, /^label-.+/);
+    assert.equal(option.actual, option.resolvedExpected);
+    const seed = report.cases[0].events.find(event => event.type === 'action' && event.intent === '生成动态选项名');
+    assert.equal(seed.actual.resolvedValue, option.resolvedExpected);
+    assert(!receipt.source_names.includes(fields['商品名称']), 'Replay reused a Source input');
+    assert(!receipt.source_options.includes(option.resolvedExpected), 'Replay reused a Source option');
+    assert(!replayNames.has(fields['商品名称']), 'Replays reused the same dynamic input');
+    assert(!replayOptions.has(option.resolvedExpected), 'Replays reused the same dynamic option');
+    replayNames.add(fields['商品名称']);
+    replayOptions.add(option.resolvedExpected);
+    evidence.dynamic_option = option.resolvedExpected;
   }
   Object.assign(evidence, { ir_result: report.result, steps: steps.length,
     assertions: steps.reduce((sum, step) => sum + step.assertions.length, 0), png_count: steps.filter(step => step.screenshot).length,
@@ -264,17 +492,27 @@ function intactCase() {
   if (savedManifest) assert.deepEqual(manifest(caseRoot), savedManifest, 'Saved IR/test/fixtures changed');
   else assert(!fs.existsSync(caseRoot), 'Failed land created a case');
 }
-async function rejected(label, args, options, output, stateError) {
+async function rejected(label, args, options, output, stateError, expectedDelta = 0) {
   const before = await observations();
   const runs = entries(output);
   const result = await invoke(label, [...args, '--output', output], options);
-  if (options.code === 2) assert.deepEqual(entries(output), runs, 'Usage error created a run directory');
+  if (options.code === 2) {
+    assert.deepEqual(entries(output), runs, 'Usage error created a run directory');
+    assert.equal(result.error.evidence, undefined, 'Preflight rejection unexpectedly returned run files');
+  }
   else {
     const added = entries(output).filter(name => !runs.includes(name));
     assert.equal(added.length, 1, 'Cannot locate exclusive failure run_dir');
-    nativeReport(path.join(output, added[0]), 'failed', stateError);
+    const files = result.error.evidence;
+    const runDir = path.dirname(files.json);
+    assert.equal(runDir, path.join(output, added[0]), 'Failure files do not match the exclusive run');
+    assert.equal(files.run_dir, undefined, 'Failure evidence must contain real file fields');
+    for (const file of Object.values(files)) assert(fs.statSync(file).isFile(), 'Failure evidence contains a non-file');
+    assert.equal(fileSha(files.ir), irSha);
+    if (savedManifest) assert.equal(fileSha(files.test_ts), savedManifest[path.join('__tests__', `${caseName}.test.ts`)]);
+    nativeReport(runDir, files, 'failed', stateError);
   }
-  await delta(before, 0);
+  await delta(before, expectedDelta);
   intactCase();
   return result;
 }
@@ -287,7 +525,7 @@ async function replay(label, args, childEnv = {}) {
   assert.equal(data.case.name, caseName);
   assert.equal(fileSha(data.ir_snapshot), irSha, 'Replay IR snapshot changed');
   if (savedManifest) assert.equal(fileSha(data.test_ts), savedManifest[path.join('__tests__', `${caseName}.test.ts`)]);
-  const proof = nativeReport(data.run_dir, 'passed');
+  const proof = nativeReport(data.run_dir, data.report, 'passed');
   await delta(before, 1);
   intactCase();
   return proof;
@@ -352,7 +590,8 @@ async function main() {
     assert(fs.statSync(path.join(depRoot, 'NOTICE')).size > 0);
     if (dependency !== '@playwright/test') assert(fs.statSync(path.join(depRoot, 'ThirdPartyNotices.txt')).size > 0);
   }
-  receipt.installed = { prefix, cli, real_cli: fs.realpathSync(cli), cli_sha256: installedCliSha, runtime_sha256: runtimeHashes, skill_sha256: installedSkillHashes,
+  const runtimeDigest = sha(Object.keys(runtimeHashes).sort().map(file => `${file.split(path.sep).join('/')}\0${runtimeHashes[file]}\n`).join(''));
+  receipt.installed = { prefix, cli, real_cli: fs.realpathSync(cli), cli_sha256: installedCliSha, runtime_sha256: runtimeHashes, runtime_digest: runtimeDigest, skill_sha256: installedSkillHashes,
     dependencies: { '@playwright/test': playwrightVersion, ws: readJson(requireInstalled.resolve('ws/package.json')).version } };
   const browserPath = await command('chromium-path', process.execPath, ['-e', 'const {createRequire}=require("node:module"); const r=createRequire(process.argv[1]); console.log(r("@playwright/test").chromium.executablePath());', path.join(installedRoot, 'package.json')], cleanEnv);
   assert.equal(browserPath.code, 0);
@@ -414,7 +653,16 @@ async function main() {
   sessions.delete(falseSid);
   const falseReport = await invoke('false-report', ['report', '-s', falseSid]);
   assert.equal(falseReport.conclusion, 'FAIL');
-  assert.equal(readJson(falseReport.json).result, 'FAIL');
+  const falseFacts = readJson(falseReport.json);
+  assert.equal(falseFacts.report_schema_version, 2);
+  assert.equal(falseFacts.result, 'FAIL');
+  factContract(falseFacts.cases[0]);
+  const falseCheck = falseFacts.cases[0].events.find(event => event.type === 'assert');
+  assert.equal(falseCheck.status, 'fail');
+  assert.equal(falseCheck.executed, true);
+  assert.equal(falseCheck.actualStatus, 'present');
+  assert.equal(falseCheck.resolvedExpected, '点击1;trusted:true');
+  assert.match(falseCheck.actual, /点击0;trusted:false/);
   assert.equal((await observations()).length, 0);
 
   const badStates = [
@@ -448,14 +696,21 @@ async function main() {
     assert(!fs.existsSync(caseRoot));
   }
 
-  const sidData = await invoke('source-start', ['session', 'start', '--auth', 'imported', '--browser', 'managed']);
+  const sidData = await invoke('source-start', ['session', 'start', '--auth', 'imported', '--browser', 'managed', '--acceptance', acceptanceFile]);
   const sid = sidData.session_id;
   sessions.add(sid);
   receipt.source_session = sid;
   assert.equal(sidData.auth_source, 'imported');
   assert.equal(sidData.browser_source, 'managed');
+  const changedAcceptance = { ...acceptanceDocument, scenarios: acceptanceDocument.scenarios.map(scenario => ({ ...scenario, goal: `${scenario.goal}（启动后修改）` })) };
+  const changedBytes = Buffer.from(JSON.stringify(changedAcceptance, null, 2));
+  fs.writeFileSync(path.join(artifacts, 'acceptance-v2.json'), changedBytes, { mode: 0o600, flag: 'wx' });
+  fs.writeFileSync(acceptanceFile, changedBytes);
+  assert.notEqual(sha(changedBytes), sha(acceptanceBytes));
+  receipt.acceptance = { input: acceptanceFile, v1: path.join(artifacts, 'acceptance-v1.json'), v1_sha256: sha(acceptanceBytes),
+    v2: path.join(artifacts, 'acceptance-v2.json'), v2_sha256: sha(changedBytes) };
   const page = (label, sub, args, group) => invoke(label, ['page', sub, '-s', sid, ...args, ...(group ? ['--group', group] : [])]);
-  const check = (label, sub, args, group) => invoke(label, ['assert', sub, '-s', sid, ...args, '--group', group]);
+  const check = (label, sub, args, group) => invoke(label, ['assert', sub, '-s', sid, ...args, '--group', group, '--check-id', label]);
   const shots = [];
   const shot = async (label, group) => { const data = await page(label, 'screenshot', ['--intent', `${group}完成态`], group); shots.push({ group, path: data.path, ...png(fs.readFileSync(data.path)) }); };
   const sourceBefore = await observations();
@@ -489,11 +744,10 @@ async function main() {
   await shot('aria-screenshot', 'aria');
   assert.equal((await invoke('source-stop', ['session', 'stop', '-s', sid])).result, 'pass');
   sessions.delete(sid);
-  const planFile = path.join(workRoot, 'plan.json');
-  fs.writeFileSync(planFile, '["click","native","aria"]');
   const sourceReport = await invoke('source-report', ['report', '-s', sid, '--plan', planFile]);
   assert.equal(sourceReport.conclusion, 'PASS');
   const report = readJson(sourceReport.json);
+  assert.equal(report.report_schema_version, 2);
   assert.equal(report.result, 'PASS');
   assert.equal(report.cases.length, 1);
   assert.deepEqual(report.cases[0].steps.map(step => [step.group, step.status]), [['click', 'pass'], ['native', 'pass'], ['aria', 'pass']]);
@@ -501,6 +755,16 @@ async function main() {
   assert.deepEqual(report.coverage.unplanned, []);
   assert.equal(report.asserts.total, 12);
   assert.equal(report.asserts.pass, 12);
+  factContract(report.cases[0]);
+  acceptanceContract(report.cases[0]);
+  assert.equal(report.cases[0].run.id, sid);
+  assert.equal(report.cases[0].run.mode, 'source');
+  assert.equal(report.cases[0].run.status, 'PASS');
+  assert.equal(report.cases[0].run.cliSha256, receipt.installed.cli_sha256);
+  assert.equal(report.cases[0].run.toolVersion, expectedPackage.version);
+  assert.equal(report.cases[0].run.env, 'default');
+  assert.equal(report.cases[0].run.authSource, sidData.auth_source);
+  assert.equal(report.cases[0].run.browserSource, sidData.browser_source);
   report.cases[0].steps.forEach(step => screenshot(step.screenshot));
   const sourceFields = fieldValues(report.cases[0].steps.flatMap(step => step.assertions));
   assert.equal(sourceFields['商品名称'], fill.saved.value);
@@ -508,11 +772,101 @@ async function main() {
   assert(fs.statSync(sourceReport.html).size > 0);
   const traceFile = path.join(workRoot, 'workspace', 'traces', sid, 'trace.jsonl');
   const events = fs.readFileSync(traceFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const frozenFile = path.join(path.dirname(traceFile), 'acceptance.json');
+  const frozenMeta = readJson(path.join(path.dirname(traceFile), 'acceptance-meta.json'));
+  assert.equal(fileSha(frozenFile), sha(acceptanceBytes), 'Source acceptance input was not frozen');
+  assert.equal(events[0].acceptance_sha256, sha(acceptanceBytes));
+  assert.equal(events[0].acceptance_frozen_at, frozenMeta.frozenAt);
+  assert.equal(report.cases[0].acceptance.frozenAt, frozenMeta.frozenAt);
+  const meta = readJson(path.join(workRoot, 'sessions', `${sid}.json`));
+  assert.equal(meta.acceptance_sha256, sha(acceptanceBytes));
+  assert.equal(meta.acceptance_frozen_at, frozenMeta.frozenAt);
   assert.equal(events.at(-1).t, 'session_end');
   assert.equal(events.at(-1).result, 'pass');
   for (const group of ['click', 'native', 'aria']) assert.equal(events.filter(event => event.group === group).at(-1).t, 'screenshot');
+  for (const shot of shots) {
+    const checks = report.cases[0].events.filter(event => event.type === 'assert' && event.group === shot.group);
+    const images = report.cases[0].images.filter(image => report.cases[0].events.find(event => event.id === image.eventId)?.group === shot.group);
+    assert.equal(screenshot(images.at(-1).src).sha256, shot.sha256, 'Source completion screenshot bytes changed');
+    assert(images.at(-1).sequence > checks.at(-1).sequence, 'Source completion screenshot precedes its last assertion');
+  }
   await delta(sourceBefore, 1);
   receipt.source = { ...sourceReport, trace: traceFile, trace_sha256: fileSha(traceFile), screenshots: shots, fields: sourceFields };
+  const sourceOption = report.cases[0].events.find(event => event.checkId === 'aria-dynamic-assert').resolvedExpected;
+  assert.match(sourceOption, /^label-.+/);
+  receipt.source_names = [fill.saved.value];
+  receipt.source_options = [sourceOption];
+  fs.writeFileSync(acceptanceFile, acceptanceBytes);
+
+  // 第二次独立录制只复验动态输入，主链路的 12 个正式检查保持完整。
+  const dynamicIds = new Set(['native-name', 'native-description', 'aria-dynamic-assert']);
+  const dynamicAcceptance = { schemaVersion: 1, scenarios: acceptanceDocument.scenarios.filter(scenario => scenario.id !== 'click')
+    .map(scenario => ({ ...scenario, checks: scenario.checks.filter(check => dynamicIds.has(check.id)) })) };
+  const dynamicFile = path.join(artifacts, 'dynamic-acceptance.json');
+  fs.writeFileSync(dynamicFile, JSON.stringify(dynamicAcceptance, null, 2), { mode: 0o600, flag: 'wx' });
+  const secondSid = (await invoke('second-source-start', ['session', 'start', '--auth', 'imported', '--browser', 'managed', '--acceptance', dynamicFile])).session_id;
+  sessions.add(secondSid);
+  const secondPage = (label, sub, args, group) => invoke(`second-${label}`, ['page', sub, '-s', secondSid, ...args, '--group', group]);
+  const secondCheck = (label, sub, args, group) => invoke(`second-${label}`, ['assert', sub, '-s', secondSid, ...args, '--group', group, '--check-id', label]);
+  await secondPage('native-open', 'open', [`${origin}/`, '--intent', '打开原生输入夹具'], 'native');
+  await invoke('second-native-state', ['page', 'state', '-s', secondSid]);
+  const secondFill = await secondPage('native-template', 'fill', ['css=#name-input', '', '--value-template', 'pkg-${random}', '--save-as', 'pkgName', '--intent', '生成本次输入'], 'native');
+  await secondPage('native-ref', 'type', ['css=#desc-input', '', '--value-ref', 'pkgName', '--intent', '消费本次输入'], 'native');
+  await secondPage('native-blur', 'press', ['Tab', '--intent', '输入失焦'], 'native');
+  await secondCheck('native-name', 'field', ['商品名称', '--value-from-action', secondFill.action_id], 'native');
+  await secondCheck('native-description', 'field', ['工具描述', '--value-ref', 'pkgName'], 'native');
+  await secondPage('native-screenshot', 'screenshot', ['--intent', '原生输入完成态'], 'native');
+  await secondPage('aria-open', 'open', [`${origin}/contract-selection`, '--intent', '打开标准ARIA夹具'], 'aria');
+  await invoke('second-aria-state', ['page', 'state', '-s', secondSid]);
+  await secondPage('aria-template', 'fill', ['css=#dyn-seed', '', '--value-template', 'label-${random}', '--save-as', 'optionName', '--intent', '生成动态选项名'], 'aria');
+  const secondSelected = await secondPage('aria-select', 'select', ['role=button:动态类目', '--value-ref', 'optionName', '--intent', '选择本次动态选项'], 'aria');
+  await secondCheck('aria-dynamic-assert', 'text', ['--within', 'css=#dyn-status', '--value-from-action', secondSelected.action_id], 'aria');
+  await secondPage('aria-screenshot', 'screenshot', ['--intent', 'ARIA完成态'], 'aria');
+  assert.equal((await invoke('second-source-stop', ['session', 'stop', '-s', secondSid])).result, 'pass');
+  sessions.delete(secondSid);
+  const secondReport = await invoke('second-source-report', ['report', '-s', secondSid]);
+  const secondFacts = readJson(secondReport.json);
+  assert.equal(secondFacts.result, 'PASS');
+  factContract(secondFacts.cases[0]);
+  acceptanceContract(secondFacts.cases[0], dynamicAcceptance);
+  const secondFields = fieldValues(secondFacts.cases[0].steps.flatMap(step => step.assertions));
+  assert.equal(secondFields['商品名称'], secondFill.saved.value);
+  assert.equal(secondFields['工具描述'], secondFill.saved.value);
+  const secondOption = secondFacts.cases[0].events.find(event => event.checkId === 'aria-dynamic-assert').resolvedExpected;
+  assert.notEqual(secondFill.saved.value, fill.saved.value, 'Independent recordings reused a dynamic input');
+  assert.notEqual(secondOption, sourceOption, 'Independent recordings reused a dynamic option');
+  receipt.source_names.push(secondFill.saved.value);
+  receipt.source_options.push(secondOption);
+  receipt.second_source = secondReport;
+
+  const blockedSid = (await invoke('blocked-source-start', ['session', 'start', '--auth', 'imported', '--browser', 'managed', '--acceptance', acceptanceFile])).session_id;
+  sessions.add(blockedSid);
+  await invoke('blocked-source-open', ['page', 'open', '-s', blockedSid, `${origin}/contract-beta-actions`, '--intent', '打开缺绑定夹具', '--group', 'click']);
+  await invoke('blocked-source-assert', ['assert', 'text', '-s', blockedSid, '点击0;trusted:false', '--within', 'css=#beta-click-status', '--group', 'click']);
+  await invoke('blocked-source-screenshot', ['page', 'screenshot', '-s', blockedSid, '--intent', '缺绑定完成态', '--group', 'click']);
+  assert.equal((await invoke('blocked-source-stop', ['session', 'stop', '-s', blockedSid])).result, 'pass');
+  sessions.delete(blockedSid);
+  const blockedReport = await invoke('blocked-source-report', ['report', '-s', blockedSid]);
+  const blockedFacts = readJson(blockedReport.json);
+  assert.equal(blockedFacts.result, 'BLOCKED');
+  assert.equal(blockedFacts.cases[0].run.status, 'PASS', 'Execution and acceptance coverage must stay distinct');
+  assert.equal(blockedFacts.cases[0].acceptanceCoverage.bound, 0);
+  assert.equal(blockedFacts.cases[0].acceptanceCoverage.total, 12);
+  assert.equal(blockedFacts.cases[0].acceptanceCoverage.result, 'UNVERIFIED');
+  assert(blockedFacts.cases[0].acceptanceCoverage.scenarios.every(scenario => scenario.checks.every(check => check.status === 'unbound')));
+  factContract(blockedFacts.cases[0]);
+  const merged = await invoke('source-merge', ['report', 'merge', sid, falseSid, blockedSid, '--title', '包验证 Source 汇总']);
+  const mergedFacts = readJson(merged.json);
+  assert.equal(mergedFacts.report_schema_version, 2);
+  assert.equal(mergedFacts.result, 'FAIL');
+  assert.equal(merged.conclusion, 'FAIL');
+  assert.equal(mergedFacts.cases.length, 3);
+  for (const [i, original] of [report, falseFacts, blockedFacts].entries()) {
+    const current = mergedFacts.cases[i];
+    assert.equal(current.result, original.result);
+    for (const key of ['run', 'events', 'images', 'flow', 'acceptance', 'acceptanceCoverage']) assert.deepEqual(current[key], original.cases[0][key], `Merge changed ${key}`);
+  }
+  receipt.source_merge = merged;
   const built = await invoke('ir-build', ['ir', 'build', '-s', sid, '--name', caseName]);
   assert.deepEqual(built.unmapped_actions, []);
   assert.deepEqual(built.dropped_steps, []);
@@ -535,6 +889,11 @@ async function main() {
   assert(checks.some(check => check.field_value?.label === '商品名称' && check.field_value.value.from_action === fillStep.id));
   assert(checks.some(check => check.field_value?.label === '工具描述' && check.field_value.value.ref === 'pkgName'));
   assert(checks.some(check => check.text?.value?.from_action === ir.steps.find(step => step.trace_ref === selected.action_id).id));
+  for (const check of ir.steps.flatMap(step => step.checks ?? []).filter(check => check.assert)) {
+    const event = report.cases[0].events.find(event => event.checkId === check.report_ref.check_id);
+    assert.equal(check.report_ref.group, event.group);
+    assert.equal(check.report_ref.source_event_id, event.id);
+  }
   const checked = await invoke('ir-check', ['ir', 'check', irFile, '--trace', sid]);
   assert.equal(checked.passed, true);
   assert.deepEqual(checked.failures, []);
@@ -550,9 +909,35 @@ async function main() {
     await rejected(`${verb}-profile-state`, [verb, irFile, '--auth', 'profile', '--browser', 'chrome', '--auth-state', state], { code: 2, error: 'USAGE' }, path.join(workRoot, 'workspace', 'verify', `${caseName}-${verb}-conflict`));
     for (const bad of badStates) await rejected(`${verb}-${bad.name}`, [verb, irFile, '--auth', 'imported', '--browser', 'managed', '--auth-state', bad.file], { code: 1, error: 'TEST_FAILED' }, path.join(workRoot, 'workspace', 'verify', `${caseName}-${verb}-${bad.name}`), bad.error);
   }
-  const auth = ['--auth', 'imported', '--browser', 'managed', '--auth-state', state];
+  const auth = ['--auth', 'imported', '--browser', 'managed', '--auth-state', state, '--acceptance', acceptanceFile];
+  const skipBefore = await observations();
+  const skipped = await invoke('verify-skip-test', ['verify', irFile, '--skip-test', ...auth]);
+  assert.equal(skipped.status, 'skipped');
+  assert.equal(skipped.report.json, undefined);
+  assert.equal(skipped.report.playwright_html, undefined);
+  assert(!fs.existsSync(path.join(skipped.run_dir, 'report.json')), 'Skipped run fabricated a Playwright report');
+  assert.equal(fileSha(skipped.ir_snapshot), irSha);
+  const skipFacts = reportFacts(skipped.run_dir, skipped.report);
+  assert.equal(skipFacts.report.result, 'BLOCKED');
+  assert.equal(skipFacts.report.cases[0].run.status, 'BLOCKED');
+  assert.deepEqual(skipFacts.report.cases[0].steps, []);
+  assert.deepEqual(skipFacts.report.cases[0].images, []);
+  assert(!skipFacts.report.cases[0].events.some(event => event.executed === true || event.type === 'action' || event.type === 'assert'));
+  assert.equal(skipFacts.report.cases[0].acceptanceCoverage.bound, 0);
+  assert.equal(skipFacts.report.cases[0].acceptanceCoverage.total, 12);
+  receipt.reports.push({ run_dir: skipped.run_dir, status: 'skipped', ...skipFacts.evidence });
+  await delta(skipBefore, 0);
+  intactCase();
   const verified = await replay('verify', ['verify', irFile, ...auth]);
   assert.notEqual(verified.fields['商品名称'], fill.saved.value, 'Replay reused the recorded literal');
+  const firstNegative = await fetch(`${origin}/fixture-mode`, { method: 'POST', body: '{"negative":true,"category_noop":false}' });
+  assert.equal(firstNegative.status, 200);
+  assert.deepEqual(await firstNegative.json(), { negative: true, category_noop: false });
+  await rejected('land-first-failure', ['land', irFile, ...auth], { code: 1, error: 'TEST_FAILED' },
+    path.join(workRoot, 'workspace', 'verify', `${caseName}-first-land-failure`), undefined, 1);
+  const restoredMode = await fetch(`${origin}/fixture-mode`, { method: 'POST', body: '{"negative":false,"category_noop":false}' });
+  assert.equal(restoredMode.status, 200);
+  assert.deepEqual(await restoredMode.json(), { negative: false, category_noop: false });
   const landBefore = await observations();
   const landed = await invoke('land', ['land', irFile, ...auth]);
   assert.equal(landed.status, 'landed');
@@ -562,7 +947,7 @@ async function main() {
   assert.equal(landed.verification.status, 'passed');
   assert.equal(fileSha(landed.verification.ir_snapshot), irSha);
   assert.equal(fileSha(landed.verification.test_ts), savedManifest[path.join('__tests__', `${caseName}.test.ts`)]);
-  nativeReport(landed.verification.run_dir, 'passed');
+  nativeReport(landed.verification.run_dir, landed.verification.report, 'passed');
   await delta(landBefore, 1);
   receipt.saved = { root: caseRoot, sha256: savedManifest };
   intactCase();
@@ -581,28 +966,31 @@ async function main() {
   assert.equal(defaultRun.length, 1);
   const archivedDefault = path.join(artifacts, 'default-root-run');
   fs.cpSync(path.join(defaultOutput, defaultRun[0]), archivedDefault, { recursive: true, filter: file => path.basename(file) !== 'node_modules' });
+  defaultProof.execution_files = Object.fromEntries(['json', 'html', 'facts_json', 'facts_archive', 'report_html', 'run_receipt'].map(key => [key, defaultProof[key]]));
   defaultProof.execution_run_dir = defaultProof.run_dir;
+  for (const key of ['json', 'html', 'facts_json', 'facts_archive', 'report_html', 'run_receipt']) {
+    defaultProof[key] = path.join(archivedDefault, path.relative(defaultProof.run_dir, defaultProof[key]));
+  }
   defaultProof.run_dir = archivedDefault;
-  defaultProof.json = path.join(archivedDefault, 'report.json');
-  defaultProof.html = path.join(archivedDefault, 'html-report', 'index.html');
   assert.equal(fileSha(defaultProof.json), defaultProof.json_sha256);
   assert.equal(fileSha(defaultProof.html), defaultProof.html_sha256);
+  assert.equal(fileSha(defaultProof.facts_json), defaultProof.facts_sha256);
+  assert.equal(fileSha(defaultProof.facts_archive), defaultProof.facts_sha256);
+  assert.equal(fileSha(defaultProof.report_html), defaultProof.report_html_sha256);
+  assert.equal(fileSha(defaultProof.run_receipt), defaultProof.run_receipt_sha256);
   await rejected('case-empty-state', ['case', 'run', caseName, '--auth', 'imported', '--browser', 'managed', '--auth-state', ''], { code: 2, error: 'USAGE' }, path.join(workRoot, 'workspace', 'verify', `${caseName}-case-empty`));
   await rejected('case-profile-state', ['case', 'run', caseName, '--auth', 'profile', '--browser', 'chrome', '--auth-state', state], { code: 2, error: 'USAGE' }, path.join(workRoot, 'workspace', 'verify', `${caseName}-case-conflict`));
   for (const bad of badStates) await rejected(`case-${bad.name}`, ['case', 'run', caseName, '--auth', 'imported', '--browser', 'managed', '--auth-state', bad.file], { code: 1, error: 'TEST_FAILED' }, path.join(workRoot, 'workspace', 'verify', `${caseName}-case-${bad.name}`), bad.error);
-  await replay('case-explicit-overrides-env', ['case', 'run', caseName, '--auth', 'auto', '--browser', 'managed', '--auth-state', state], { E2ET_REPLAY_AUTH: 'invalid', E2ET_REPLAY_BROWSER: 'invalid', E2ET_AUTH_STATE: badStates[0].file });
+  await replay('case-explicit-overrides-env', ['case', 'run', caseName, '--auth', 'auto', '--browser', 'managed', '--auth-state', state, '--acceptance', acceptanceFile], { E2ET_REPLAY_AUTH: 'invalid', E2ET_REPLAY_BROWSER: 'invalid', E2ET_AUTH_STATE: badStates[0].file });
   const negativeMode = await fetch(`${origin}/fixture-mode`, { method: 'POST', body: '{"negative":true,"category_noop":false}' });
   assert.equal(negativeMode.status, 200);
   assert.deepEqual(await negativeMode.json(), { negative: true, category_noop: false });
-  const beforeNegative = await observations();
   const negativeOutput = path.join(workRoot, 'workspace', 'verify', `${caseName}-negative`);
-  await invoke('case-negative', ['case', 'run', caseName, ...auth, '--output', negativeOutput], { code: 1, error: 'TEST_FAILED' });
-  const negativeRuns = entries(negativeOutput);
-  assert.equal(negativeRuns.length, 1, 'No exclusive negative run_dir');
-  nativeReport(path.join(negativeOutput, negativeRuns[0]), 'failed');
-  assert.equal(fileSha(path.join(negativeOutput, negativeRuns[0], '__tests__', `${caseName}.test.ts`)), savedManifest[path.join('__tests__', `${caseName}.test.ts`)]);
-  await delta(beforeNegative, 1);
+  await rejected('case-negative', ['case', 'run', caseName, ...auth], { code: 1, error: 'TEST_FAILED' }, negativeOutput, undefined, 1);
+  await rejected('land-force-failure', ['land', irFile, ...auth, '--force'], { code: 1, error: 'TEST_FAILED' },
+    path.join(workRoot, 'workspace', 'verify', `${caseName}-force-failure`), undefined, 1);
   intactCase();
+  assert(replayNames.size >= 2 && replayOptions.size >= 2, 'Missing independent dynamic replays');
   receipt.status = 'passed';
 }
 

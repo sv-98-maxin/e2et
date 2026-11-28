@@ -87,9 +87,12 @@ describe('report observation 归组(P2)', () => {
     const stepA = json.cases[0].steps.find((s: any) => s.group === 'A');
     expect(stepA).toBeDefined();
     expect(stepA.status).toBe('pass'); // 观察/断言归组不改变结论
-    expect(stepA.observation).toContain('页面数据观察');
+    // observedObservation 现在用可读标签，不含「页面数据观察」原始前缀
+    expect(stepA.observation).toContain('present');
+    expect(stepA.observation).toContain('存储');  // 可读标签替代 JSON.stringify
     expect(stepA.observation).toContain('present=true');
-    expect(stepA.assertDetails.some((d: string) => d.includes('observation o1'))).toBe(true);
+    // observations 用 observedObservation() 格式，不含原始 id 前缀；验证观察内容在 assertDetails 中
+    expect(stepA.assertDetails.some((d: string) => d.includes('页面数据') || d.includes('全局变量') || d.includes('present'))).toBe(true);
     // 孤立观察:不进业务步骤,进诊断附录
     expect(json.diagnostic_observations).toHaveLength(1);
     expect(json.diagnostic_observations[0].id).toBe('o2');
@@ -99,7 +102,7 @@ describe('report observation 归组(P2)', () => {
     // action 计数不伪造:只有 1 个 action
     expect(json.actions.total).toBe(1);
     // HTML 展示观察与孤立观察
-    expect(html).toContain('页面数据观察');
+    expect(html).toContain('存储「cfg」');  // 可读标签替代「页面数据观察」
     expect(html).toContain('孤立观察');
   });
 

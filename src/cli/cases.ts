@@ -8,7 +8,7 @@ import {
   type ReplaySelection,
 } from '../shared/replay-env.js';
 import {
-  loadStaticCase, readFullCase, readStoredCase,
+  readFullCase, readStoredCase,
   isCaseName, isLoadFailure,
 } from '../cases/snapshot.js';
 import { verifyCase as serviceVerifyCase, type VerificationEnvironment } from '../cases/replay.js';
@@ -16,6 +16,9 @@ import { caseLibraryRoot as serviceCaseLibraryRoot, listCases as serviceListCase
 import { emitOk, emitError, diag, EXIT_USAGE, EXIT_VALIDATION, type Deps } from './context.js';
 import { parseArgs } from './args.js';
 import { commandDefinitions } from './commands.js';
+import { AcceptanceInputError, readAcceptanceInput, type AcceptanceInput } from '../report/acceptance.js';
+import { irDigest } from '../render/render.js';
+import type { CaseSnapshot } from '../cases/snapshot.js';
 
 function getArgs(name: string, sub?: string) {
   return commandDefinitions().find((c) => c.name === name && c.subcommand === sub)?.args ?? [];
@@ -63,6 +66,9 @@ async function replaySelectionFromArgs(
 
 function makeVerifyEnv(d: Deps, replay: ReplaySelection): VerificationEnvironment {
   const replayEnv = { ...d.env };
+  delete replayEnv.E2ET_RUN_ACCEPTANCE_DIR;
+  delete replayEnv.E2ET_RUN_ID;
+  delete replayEnv.E2ET_RUN_ENV;
   if (replay.auth) replayEnv.E2ET_AUTH = replay.auth;
   if (replay.browser) replayEnv.E2ET_REPLAY_BROWSER = replay.browser;
   if (replay.authState) replayEnv.E2ET_AUTH_STATE = replay.authState;
@@ -72,6 +78,16 @@ function makeVerifyEnv(d: Deps, replay: ReplaySelection): VerificationEnvironmen
     playwrightRunner: (env, cliPackageRoot, testFile, testTimeoutMs) =>
       d.playwrightRunner({ ...d, env }, cliPackageRoot, testFile, testTimeoutMs),
   };
+}
+
+function acceptanceFromArgs(d: Deps, values: Record<string, string>, snapshot: CaseSnapshot): { input?: AcceptanceInput } | { exit: number } {
+  try {
+    const file = values['--acceptance'];
+    return { input: readAcceptanceInput(file === undefined ? undefined : path.resolve(d.cwd, file), snapshot.ir, irDigest(snapshot.ir)) };
+  } catch (error) {
+    if (error instanceof AcceptanceInputError) return { exit: emitError(d, error.code, error.message, undefined, EXIT_USAGE) };
+    throw error;
+  }
 }
 
 export function handleCase(d: Deps, argv: string[]): Promise<number> {
@@ -98,13 +114,15 @@ async function caseRun(d: Deps, argv: string[]): Promise<number> {
   const library = serviceCaseLibraryRoot(d.homeDir);
   const snapshot = readStoredCase(library, name);
   if (isLoadFailure(snapshot)) return emitLoadFailure(d, snapshot);
+  const acceptance = acceptanceFromArgs(d, values, snapshot);
+  if ('exit' in acceptance) return acceptance.exit;
   const replay = await replaySelectionFromArgs(values, d);
   if ('error' in replay) return emitError(d, 'USAGE', replay.error, undefined, EXIT_USAGE);
   const env = makeVerifyEnv(d, replay.selection);
-  const result = await serviceVerifyCase(env, snapshot, { skip: false, output: values['--output'], replay: replay.selection });
+  const result = await serviceVerifyCase(env, snapshot, { skip: false, output: values['--output'], replay: replay.selection, acceptance: acceptance.input });
   if (!result.ok) {
     const kind = result.error.kind;
-    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION);
+    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION, result.error.evidence);
   }
   return emitOk(d, result.data);
 }
@@ -114,13 +132,15 @@ export async function handleVerify(d: Deps, argv: string[]): Promise<number> {
   if (errors.length) return emitError(d, 'USAGE', errors.join('; '), undefined, EXIT_USAGE);
   const snapshot = readFullCase(values['ir-file']);
   if (isLoadFailure(snapshot)) return emitLoadFailure(d, snapshot);
+  const acceptance = acceptanceFromArgs(d, values, snapshot);
+  if ('exit' in acceptance) return acceptance.exit;
   const replay = await replaySelectionFromArgs(values, d);
   if ('error' in replay) return emitError(d, 'USAGE', replay.error, undefined, EXIT_USAGE);
   const env = makeVerifyEnv(d, replay.selection);
-  const result = await serviceVerifyCase(env, snapshot, { skip: values['--skip-test'] === 'true', output: values['--output'], replay: replay.selection });
+  const result = await serviceVerifyCase(env, snapshot, { skip: values['--skip-test'] === 'true', output: values['--output'], replay: replay.selection, acceptance: acceptance.input });
   if (!result.ok) {
     const kind = result.error.kind;
-    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION);
+    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION, result.error.evidence);
   }
   return emitOk(d, result.data);
 }
@@ -130,13 +150,15 @@ export async function handleLand(d: Deps, argv: string[]): Promise<number> {
   if (errors.length) return emitError(d, 'USAGE', errors.join('; '), undefined, EXIT_USAGE);
   const snapshot = readFullCase(values['ir-file']);
   if (isLoadFailure(snapshot)) return emitLoadFailure(d, snapshot);
+  const acceptance = acceptanceFromArgs(d, values, snapshot);
+  if ('exit' in acceptance) return acceptance.exit;
   const replay = await replaySelectionFromArgs(values, d);
   if ('error' in replay) return emitError(d, 'USAGE', replay.error, undefined, EXIT_USAGE);
   const env = { ...makeVerifyEnv(d, replay.selection), homeDir: d.homeDir };
-  const result = await serviceLandCase(env, snapshot, { force: values['--force'] === 'true', output: values['--output'], replay: replay.selection });
+  const result = await serviceLandCase(env, snapshot, { force: values['--force'] === 'true', output: values['--output'], replay: replay.selection, acceptance: acceptance.input });
   if (!result.ok) {
     const kind = result.error.kind;
-    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION);
+    return emitError(d, result.error.code, result.error.message, result.error.hint, kind === 'usage' ? EXIT_USAGE : kind === 'environment' ? 3 : EXIT_VALIDATION, result.error.evidence);
   }
   return emitOk(d, result.data);
 }

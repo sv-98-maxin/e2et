@@ -63,6 +63,7 @@ const COMMAND_TABLE: CommandDef[] = [
       { name: '--env', kind: 'string', description: '通用环境标签（默认 default；不选择 URL、商家、凭据或 CI）' },
       { name: '--auth', kind: 'enum', enum: ['auto', 'profile', 'imported'], description: '登录态来源（默认 auto：profile → imported）' },
       { name: '--browser', kind: 'enum', enum: ['auto', 'existing', 'chrome', 'managed'], description: '浏览器端点（默认 auto：profile 强制选 chrome；否则优先可达的现成 CDP）' },
+      { name: '--acceptance', kind: 'string', description: '启动前校验并冻结验收说明 JSON 文件，后续只读取本次快照' },
     ],
   },
   {
@@ -135,6 +136,7 @@ const COMMAND_TABLE: CommandDef[] = [
       { name: 'expression', kind: 'string', required: true, description: 'JavaScript 表达式（结果需 JSON-serializable）' },
       { name: '--intent', kind: 'string', required: true, description: '本步骤意图（步骤名）' },
       { name: '--await-promise', kind: 'flag', description: '等待 Promise resolve（默认关闭，传 --await-promise 开启）' },
+      { name: '--group', kind: 'string', description: '显式场景标签，脚本操作完整保留在执行时间线' },
     ],
   },
   {
@@ -597,6 +599,7 @@ const COMMAND_TABLE: CommandDef[] = [
       { name: '--auth', kind: 'enum', enum: ['auto', 'profile', 'imported'], description: '本次回放登录态（默认 auto：有效 state → imported，否则 profile → imported）' },
       { name: '--browser', kind: 'enum', enum: ['auto', 'existing', 'chrome', 'managed'], description: '本次回放浏览器（默认 auto）' },
       { name: '--auth-state', kind: 'string', description: '本次显式标准 storageState；不能与 profile/chrome 混用' },
+      { name: '--acceptance', kind: 'string', description: '本次验收说明 JSON 文件，执行前校验并冻结' },
     ],
   },
   {
@@ -617,6 +620,7 @@ const COMMAND_TABLE: CommandDef[] = [
       { name: '--browser', kind: 'enum', enum: ['auto', 'existing', 'chrome', 'managed'], description: '本次回放浏览器（默认 auto）' },
       { name: '--auth-state', kind: 'string', description: '本次显式标准 storageState；不能与 profile/chrome 混用' },
       { name: '--skip-test', kind: 'flag', description: '跳过 Playwright 执行，只跑 check+judge+render' },
+      { name: '--acceptance', kind: 'string', description: '本次验收说明 JSON 文件，执行前校验并冻结' },
     ],
   },
   {
@@ -629,6 +633,11 @@ const COMMAND_TABLE: CommandDef[] = [
       { name: '--browser', kind: 'enum', enum: ['auto', 'existing', 'chrome', 'managed'], description: '本次回放浏览器（默认 auto）' },
       { name: '--auth-state', kind: 'string', description: '本次显式标准 storageState；不能与 profile/chrome 混用' },
       { name: '--force', kind: 'flag', description: '目标文件已存在时覆盖（默认拒绝）' },
+      { name: '--acceptance', kind: 'string', description: '本次验收说明 JSON 文件，执行前校验并冻结' },
     ],
   },
 ];
+
+for (const command of COMMAND_TABLE) {
+  if (command.name === 'assert') command.args.push({ name: '--check-id', kind: 'string', description: '绑定当前冻结验收说明内、属于本次有效 group 的检查 ID' });
+}

@@ -128,9 +128,11 @@ e2et land "$ir" --auth imported --browser managed --auth-state "$auth_state"
 e2et case run example-domain --auth imported --browser managed --auth-state "$auth_state"
 ```
 
-`case run` 要核 `data.status=passed`，并读取 `data.run_dir` / `data.report`。回放 JSON 是 Playwright 报告，不是 Source 报告结构：读取最终 test result 的 `ir-report` 附件（内联 body 按 base64 解码，文件附件按 path 读取），核其中的 `result=PASS`、cases、steps 与 assertions。缺附件不能判 PASS。
+`case run` 要核 `data.status=passed`，读取 `data.report.facts_json` 指向的最终 schema 2 报告，检查 `result=PASS`、cases、steps、assertions 与验收覆盖。再对照 `data.report.json` 的 Playwright 原始 JSON，包括最终 test result 与 errors，以及 `data.report.playwright_html` 的原生 HTML。`ir-report` 附件只是中间证据，不能据此判最终通过。`land` 使用 `data.verification.report` 下的同名路径；失败时从 `error.evidence` 读取实际存在的文件。
 
-`verify` 默认也会真实回放（`--skip-test` 才跳过）；不要习惯性在 `land` 前加一次 `verify`，否则页面步骤又会执行一遍。`render` 只重编译 IR，`data.status=compiled` 与 `data.replay=not_run` **不是回放证据**。`case run` 执行已保存测试的原字节，不从原 trace 重新构建。
+报告的 `sessionId` 标识本次回放 run，`cases[].recording.session_id` 标识录制时的 Source 会话。本次工具版本、CLI/runtime SHA、浏览器与身份位于 `cases[].run`。`runtime-environment` 附件是启动快照，status 初始为 `BLOCKED`；最终状态以 `facts_json` 和 Playwright 的最后结果为准。
+
+`verify` 默认也会真实回放（`--skip-test` 才跳过，并生成 `BLOCKED` 事实报告）；不要习惯性在 `land` 前加一次 `verify`，否则页面步骤又会执行一遍。`render` 只重编译 IR，`data.status=compiled` 与 `data.replay=not_run` **不是回放证据**。`case run` 执行已保存测试的原字节，不从原 trace 重新构建。
 
 ## 路径、身份与安全边界
 

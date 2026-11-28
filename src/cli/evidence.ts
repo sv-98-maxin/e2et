@@ -25,7 +25,8 @@ export async function handleAssert(d: Deps, argv: string[]): Promise<number> {
     const equals = parseEqualsScalar(values['--equals'] ?? '');
     if (!equals.ok) return emitError(d, 'USAGE', equals.message, undefined, EXIT_USAGE);
     const params: Record<string, unknown> = { ...parsed.source, equals: equals.value };
-    if (values['--group']) params.group = values['--group'];
+    if (values['--group'] !== undefined) params.group = values['--group'];
+    if (values['--check-id'] !== undefined) params.check_id = values['--check-id'];
     if (values['--frame']) params.frame = values['--frame'];
     return callDaemon(d, sid, 'assert.data', params);
   }
@@ -86,7 +87,8 @@ export async function handleAssert(d: Deps, argv: string[]): Promise<number> {
     if (hasRef) params.value_ref = values['--value-ref'];
     if (hasFromAction) params.value_from_action = values['--value-from-action'];
   }
-  if (values['--group']) params.group = values['--group'];
+  if (values['--group'] !== undefined) params.group = values['--group'];
+  if (values['--check-id'] !== undefined) params.check_id = values['--check-id'];
   return callDaemon(d, sid, 'assert.' + subNorm, params);
 }
 

@@ -2,6 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
+import type { JSONReport, JSONReportSuite, JSONReportTestResult } from '@playwright/test/reporter';
 import { packageRoot, readPackageVersion } from '../package-version.js';
 import { PLAYWRIGHT_VERSION } from '../shared/versions.js';
 import { replayTimeoutMs } from '../wait-timeout.js';
@@ -10,6 +12,11 @@ import { linkedPath } from '../path-safety.js';
 import type { OperationResult } from '../operation-result.js';
 import type { ReplaySelection } from '../shared/replay-env.js';
 import { testFileDigest, type CaseSnapshot } from './snapshot.js';
+import { AcceptanceInputError, freezeAcceptance, readAcceptanceSnapshot, type AcceptanceInput } from '../report/acceptance.js';
+import { finalizeReport, type ReplayTestResult } from '../shared/report-finalize.js';
+import { renderReportHtml } from '../shared/report-render.js';
+import { projectReportValue } from '../shared/acceptance.js';
+import type { AcceptanceSnapshot, ReportData, ReportRun } from '../shared/report-model.js';
 
 export interface VerificationEnvironment {
   env: NodeJS.ProcessEnv;
@@ -36,22 +43,22 @@ export interface VerifyData {
   run_dir: string;
   status: 'skipped' | 'passed';
   runtime?: { e2et_version: string; playwright_version: string; source: 'bundled' };
-  report?: { kind: 'replay'; json: string; html: string };
+  report?: { kind: 'replay'; json?: string; html: string; facts_json: string; playwright_html?: string };
 }
 
-function failure(code: string, message: string, hint: string | undefined, kind: 'usage' | 'validation' | 'environment'): OperationResult<never> {
-  return { ok: false, error: { code, message, ...(hint ? { hint } : {}), kind } };
+function failure(code: string, message: string, hint: string | undefined, kind: 'usage' | 'validation' | 'environment', evidence?: Record<string, string>): Extract<OperationResult<never>, { ok: false }> {
+  return { ok: false, error: { code, message, ...(hint ? { hint } : {}), kind, ...(evidence ? { evidence } : {}) } };
 }
 
-function validation(code: string, message: string, hint?: string): OperationResult<never> {
+function validation(code: string, message: string, hint?: string): Extract<OperationResult<never>, { ok: false }> {
   return failure(code, message, hint, 'validation');
 }
 
-function environmentError(code: string, message: string, hint?: string): OperationResult<never> {
+function environmentError(code: string, message: string, hint?: string): Extract<OperationResult<never>, { ok: false }> {
   return failure(code, message, hint, 'environment');
 }
 
-function usage(code: string, message: string, hint?: string): OperationResult<never> {
+function usage(code: string, message: string, hint?: string): Extract<OperationResult<never>, { ok: false }> {
   return failure(code, message, hint, 'usage');
 }
 
@@ -67,7 +74,7 @@ function readPlaywrightVersion(resolver: NodeRequire): string {
 export async function verifyCase(
   environment: VerificationEnvironment,
   snapshot: CaseSnapshot,
-  options: { skip: boolean; output?: string; replay: ReplaySelection },
+  options: { skip: boolean; output?: string; replay: ReplaySelection; acceptance?: AcceptanceInput },
 ): Promise<OperationResult<VerifyData>> {
   const verifyRoot = path.resolve(e2etRoot(environment.env), 'workspace', 'verify');
   const parent = path.resolve(options.output ?? verifyRoot);
@@ -75,15 +82,54 @@ export async function verifyCase(
   if (linkedPath(parent)) return validation('SYMLINK', 'verify 根、父目录或 output 是 symlink');
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
   const runDir = fs.mkdtempSync(path.join(parent, `${snapshot.ir.name}-`));
-  fs.writeFileSync(path.join(runDir, 'package.json'), '{"type":"module"}');
   const irPath = path.join(runDir, `${snapshot.ir.name}.ir.json`);
   const testPath = path.join(runDir, '__tests__', `${snapshot.ir.name}.test.ts`);
-  fs.mkdirSync(path.dirname(testPath));
-  fs.writeFileSync(irPath, snapshot.raw);
-  fs.writeFileSync(testPath, snapshot.test);
   const fixtureDir = path.join(runDir, 'cases', 'fixtures', snapshot.ir.name);
-  fs.mkdirSync(fixtureDir, { recursive: true });
-  for (const [name, bytes] of snapshot.fixtures) fs.writeFileSync(path.join(fixtureDir, name), bytes);
+  const reportJson = path.join(runDir, 'report.json');
+  const reportHtml = path.join(runDir, 'report.html');
+  const factsJson = path.join(runDir, 'report-data.json');
+  const playwrightHtml = path.join(runDir, 'html-report', 'index.html');
+  const receiptFile = path.join(runDir, 'run.json');
+  const errorFile = path.join(runDir, 'error-evidence.json');
+  const run: ReportRun = {
+    id: path.basename(runDir), mode: 'replay', status: 'BLOCKED', startedAt: Date.now(),
+    toolVersion: readPackageVersion(), env: environment.env.TEST_ENV ?? 'default',
+  };
+  let acceptance: AcceptanceSnapshot | undefined;
+  let finalReport: ReportData | undefined;
+  let code: number | undefined;
+  const errors: NonNullable<ReportRun['errors']> = [];
+  const blockedErrors: NonNullable<ReportRun['errors']> = [];
+  const paths = (): Record<string, string> => existingFiles({
+    json: reportJson, html: reportHtml, facts_json: factsJson, playwright_html: playwrightHtml,
+    run_receipt: receiptFile, error_json: errorFile, ir: irPath, test_ts: testPath,
+  });
+  const writeFinalReport = (): ReportData => {
+    run.endedAt = Date.now();
+    const original = options.skip ? { tests: [] as ReplayTestResult[], errors: [], blockedErrors: [] } : readFinalPlaywright(reportJson, runDir);
+    finalReport = finalizeReport({
+      tests: original.tests, run, exitCode: code, errors: [...original.errors, ...errors],
+      blockedErrors: [...original.blockedErrors, ...blockedErrors], acceptance,
+      title: snapshot.ir.name, url: snapshot.ir.url,
+      links: fs.existsSync(playwrightHtml) ? [{ label: 'Playwright 原生详情', url: './html-report/index.html' }] : undefined,
+    });
+    fs.writeFileSync(factsJson, JSON.stringify(finalReport, null, 2), { mode: 0o600 });
+    fs.writeFileSync(reportHtml, renderReportHtml(finalReport), { mode: 0o600 });
+    fs.writeFileSync(receiptFile, JSON.stringify({
+      ...run, status: finalReport.cases[0]?.run?.status ?? 'BLOCKED',
+      runtime_hash_algorithm: 'sha256(sorted(relativePath + NUL + sha256(fileBytes) + LF)); __tests__ excluded',
+      acceptance_sha256: acceptance?.sha256,
+      replay_selection: options.replay,
+    }, null, 2), { mode: 0o600 });
+    return finalReport;
+  };
+  const failRun = (result: Extract<OperationResult<never>, { ok: false }>): OperationResult<never> => {
+    try { if (!finalReport || finalReport.result === 'PASS') writeFinalReport(); } catch (error) {
+      environment.diagnostic(`❌ 最终报告写入失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try { fs.writeFileSync(errorFile, JSON.stringify(projectReportValue(result.error).value, null, 2), { mode: 0o600 }); } catch {}
+    return { ok: false, error: { ...result.error, evidence: paths() } };
+  };
   const caseData = {
     name: snapshot.ir.name,
     ir_file: snapshot.sourceIrFile,
@@ -91,14 +137,27 @@ export async function verifyCase(
     test_sha256: testFileDigest(snapshot.test),
     test_compiler: snapshot.compiler,
   };
-  if (options.skip) return { ok: true, data: { case: caseData, ir: snapshot.ir.name, ir_snapshot: irPath, test_ts: testPath, run_dir: runDir, status: 'skipped' } };
   try {
+    fs.writeFileSync(path.join(runDir, 'package.json'), '{"type":"module"}');
+    fs.mkdirSync(path.dirname(testPath));
+    fs.writeFileSync(irPath, snapshot.raw);
+    fs.writeFileSync(testPath, snapshot.test);
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    for (const [name, bytes] of snapshot.fixtures) fs.writeFileSync(path.join(fixtureDir, name), bytes);
+    acceptance = freezeAcceptance(options.acceptance, runDir);
+    if (options.skip) {
+      writeFinalReport();
+      return { ok: true, data: {
+        case: caseData, ir: snapshot.ir.name, ir_snapshot: irPath, test_ts: testPath, run_dir: runDir,
+        status: 'skipped', report: { kind: 'replay', html: reportHtml, facts_json: factsJson },
+      } };
+    }
     const cliPackageRoot = packageRoot();
-    if (!cliPackageRoot) return environmentError('ENV_UNAVAILABLE', '无法定位 CLI 包根', '重新安装 e2et 后重试');
+    if (!cliPackageRoot) return failRun(environmentError('ENV_UNAVAILABLE', '无法定位 CLI 包根', '重新安装 e2et 后重试'));
     const cliRequire = createRequire(path.join(cliPackageRoot, 'package.json'));
     const cliPlaywright = readPlaywrightVersion(cliRequire);
     if (cliPlaywright !== PLAYWRIGHT_VERSION) {
-      return validation('PLAYWRIGHT_VERSION_UNSUPPORTED', `CLI @playwright/test ${cliPlaywright || '未安装/不可解析'}，verify 需要精确 ${PLAYWRIGHT_VERSION}`, '重新安装 e2et 后重试');
+      return failRun(validation('PLAYWRIGHT_VERSION_UNSUPPORTED', `CLI @playwright/test ${cliPlaywright || '未安装/不可解析'}，verify 需要精确 ${PLAYWRIGHT_VERSION}`, '重新安装 e2et 后重试'));
     }
     const dependencies = path.join(runDir, 'node_modules');
     fs.mkdirSync(path.join(dependencies, '@playwright'), { recursive: true });
@@ -112,29 +171,45 @@ export async function verifyCase(
     try {
       cliWs = cliRequire.resolve('ws/package.json');
     } catch {
-      return environmentError('ENV_UNAVAILABLE', 'CLI 安装依赖无法解析 ws，回放 runtime 需要 ws', '重新安装 e2et 后重试');
+      return failRun(environmentError('ENV_UNAVAILABLE', 'CLI 安装依赖无法解析 ws，回放 runtime 需要 ws', '重新安装 e2et 后重试'));
     }
     fs.symlinkSync(path.dirname(cliWs), path.join(dependencies, 'ws'), 'dir');
     fs.cpSync(path.join(cliPackageRoot, 'runtime_assets', 'runtime'), path.join(runDir, 'runtime'), { recursive: true });
+    run.runtimeSha256 = hashRuntime(path.join(runDir, 'runtime'));
+    const cliFile = path.join(cliPackageRoot, 'dist', 'cli.js');
+    if (fs.existsSync(cliFile)) run.cliSha256 = createHash('sha256').update(fs.readFileSync(cliFile)).digest('hex');
+    fs.writeFileSync(receiptFile, JSON.stringify(run), { mode: 0o600 });
     const replayEnv: NodeJS.ProcessEnv = {
       ...environment.env,
       E2ET_REPLAY_AUTH: options.replay.auth,
       E2ET_REPLAY_BROWSER: options.replay.browser,
+      E2ET_RUN_ID: run.id,
+      E2ET_RUN_ENV: run.env,
+      E2ET_RUN_ACCEPTANCE_DIR: acceptance ? runDir : undefined,
       ...(options.replay.authState !== undefined
         ? { E2ET_AUTH_STATE: options.replay.authState }
         : { E2ET_AUTH_STATE: undefined }),
     };
-    const code = await environment.playwrightRunner(replayEnv, cliPackageRoot, testPath, replayTimeoutMs(snapshot.ir.steps));
-    const reportJson = path.join(runDir, 'report.json');
-    const reportHtml = path.join(runDir, 'html-report');
-    if (code !== 0) return validation('TEST_FAILED', `Playwright 退出码 ${code}`, `证据目录: ${runDir}；replay 报告: ${reportJson} / ${reportHtml}；若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线`);
+    code = await environment.playwrightRunner(replayEnv, cliPackageRoot, testPath, replayTimeoutMs(snapshot.ir.steps));
     const intact =
       !linkedPath(irPath) && fs.existsSync(irPath) && fs.readFileSync(irPath).equals(snapshot.raw) &&
       !linkedPath(testPath) && fs.existsSync(testPath) && fs.readFileSync(testPath).equals(snapshot.test) &&
       [...snapshot.fixtures].every(([name, bytes]) => { const file = path.join(fixtureDir, name); return !linkedPath(file) && fs.existsSync(file) && fs.readFileSync(file).equals(bytes); });
-    if (!intact) return validation('EVIDENCE_TAMPERED', '执行后 run 目录内 IR/.test.ts/fixture 被篡改或缺失', `证据目录: ${runDir}`);
+    if (!intact || hashRuntime(path.join(runDir, 'runtime')) !== run.runtimeSha256) {
+      errors.push({ code: 'EVIDENCE_TAMPERED', message: '执行后 run 目录内 IR/.test.ts/fixture/runtime 被篡改或缺失' });
+      return failRun(validation('EVIDENCE_TAMPERED', errors[0]!.message, `证据目录: ${runDir}`));
+    }
+    const frozen = readAcceptanceSnapshot(runDir);
+    if (frozen?.sha256 !== acceptance?.sha256 || frozen?.frozenAt !== acceptance?.frozenAt) throw new AcceptanceInputError('执行后验收快照与本次冻结输入不一致');
+    const nativeHtmlError = verifyReportHtml(playwrightHtml);
+    if (nativeHtmlError) blockedErrors.push({ code: 'PLAYWRIGHT_HTML_UNAVAILABLE', message: nativeHtmlError });
+    const data = writeFinalReport();
+    if (data.result !== 'PASS') return failRun(validation(data.result === 'FAIL' ? 'TEST_FAILED' : 'TEST_BLOCKED',
+      `Playwright 退出码 ${code}；最终报告 ${data.result}`, `证据目录: ${runDir}`));
   } catch (e) {
-    return validation('TEST_FAILED', `Playwright 执行失败: ${(e as Error).message}`, `证据目录: ${runDir}；若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线`);
+    const message = e instanceof Error ? e.message : String(e);
+    errors.push({ code: e instanceof AcceptanceInputError ? e.code : 'TEST_FAILED', message });
+    return failRun(failure(errors.at(-1)!.code!, message, `证据目录: ${runDir}`, e instanceof AcceptanceInputError ? 'usage' : 'validation'));
   }
   return { ok: true, data: {
     case: caseData,
@@ -144,8 +219,91 @@ export async function verifyCase(
     test_ts: testPath,
     run_dir: runDir,
     status: 'passed',
-    report: { kind: 'replay', json: path.join(runDir, 'report.json'), html: path.join(runDir, 'html-report') },
+    report: { kind: 'replay', json: reportJson, html: reportHtml, facts_json: factsJson, playwright_html: playwrightHtml },
   } };
+}
+
+function existingFiles(files: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(files).filter(([, file]) => {
+    try { return !linkedPath(file) && fs.lstatSync(file).isFile(); } catch { return false; }
+  }));
+}
+
+function hashRuntime(directory: string): string {
+  const files: string[] = [];
+  const visit = (parent: string): void => {
+    for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+      if (entry.name === '__tests__') continue;
+      const file = path.join(parent, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile()) files.push(file);
+    }
+  };
+  visit(directory);
+  const manifest = files.map(file => ({ relative: path.relative(directory, file).split(path.sep).join('/'), file }))
+    .sort((first, second) => first.relative < second.relative ? -1 : first.relative > second.relative ? 1 : 0)
+    .map(entry => `${entry.relative}\0${createHash('sha256').update(fs.readFileSync(entry.file)).digest('hex')}\n`).join('');
+  return createHash('sha256').update(manifest).digest('hex');
+}
+
+function readAttachment(result: JSONReportTestResult, name: string, runDir: string): unknown {
+  const attachments = result.attachments?.filter(attachment => attachment.name === name) ?? [];
+  if (!attachments.length) return undefined;
+  if (attachments.length !== 1) throw new Error(`${name} 附件重复`);
+  const attachment = attachments[0]!;
+  if (attachment.body !== undefined) return JSON.parse(Buffer.from(attachment.body, 'base64').toString('utf8'));
+  if (!attachment.path) throw new Error(`${name} 附件没有 body/path`);
+  const file = path.resolve(runDir, attachment.path);
+  if (!file.startsWith(runDir + path.sep) || linkedPath(file) || !fs.lstatSync(file).isFile()) throw new Error(`${name} 附件路径不属于本次 run 普通文件`);
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function readFinalPlaywright(file: string, runDir: string): {
+  tests: ReplayTestResult[]; errors: NonNullable<ReportRun['errors']>; blockedErrors: NonNullable<ReportRun['errors']>;
+} {
+  const tests: ReplayTestResult[] = [];
+  const errors: NonNullable<ReportRun['errors']> = [];
+  const blockedErrors: NonNullable<ReportRun['errors']> = [];
+  try {
+    if (linkedPath(file) || !fs.lstatSync(file).isFile()) throw new Error('原生 JSON 报告不是普通文件');
+    const report = JSON.parse(fs.readFileSync(file, 'utf8')) as JSONReport;
+    const invalid = verifyReportJson(file);
+    if (invalid && !invalid.startsWith('JSON 报告存在最终 ')) blockedErrors.push({ code: 'PLAYWRIGHT_JSON_INVALID', message: invalid });
+    if (Array.isArray(report.errors)) for (const error of report.errors) if (typeof error?.message === 'string') errors.push({ message: error.message });
+    const visit = (suite: JSONReportSuite): void => {
+      if (!suite || typeof suite !== 'object') return;
+      if (Array.isArray(suite.suites)) suite.suites.forEach(visit);
+      if (!Array.isArray(suite.specs)) return;
+      for (const spec of suite.specs) {
+        if (!Array.isArray(spec?.tests)) continue;
+        for (const test of spec.tests) {
+          const result = Array.isArray(test?.results) ? test.results.at(-1) : undefined;
+          const startedAt = result?.startTime ? Date.parse(result.startTime) : undefined;
+          const item: ReplayTestResult = {
+            id: spec.id, name: spec.title, status: result?.status,
+            durationMs: result?.duration,
+            startedAt: Number.isFinite(startedAt) ? startedAt : undefined,
+            endedAt: Number.isFinite(startedAt) && typeof result?.duration === 'number' ? startedAt! + result.duration : undefined,
+            errors: result?.errors?.filter(error => typeof error?.message === 'string').map(error => ({ message: error.message })),
+          };
+          if (result) {
+            try {
+              item.report = readAttachment(result, 'ir-report', runDir);
+            } catch (error) { item.reportError = error instanceof Error ? error.message : String(error); }
+            try {
+              item.environment = readAttachment(result, 'replay-environment', runDir) as ReplayTestResult['environment'];
+              if (!item.environment) item.blockedErrors = [{ code: 'REPLAY_ENVIRONMENT_UNAVAILABLE', message: '本次测试没有 replay-environment 附件；未用请求参数补造实际 auth/browser' }];
+            } catch (error) { item.blockedErrors = [{ code: 'REPLAY_ENVIRONMENT_INVALID', message: error instanceof Error ? error.message : String(error) }]; }
+          }
+          tests.push(item);
+        }
+      }
+    };
+    if (Array.isArray(report.suites)) report.suites.forEach(visit);
+  } catch (error) {
+    blockedErrors.push({ code: 'PLAYWRIGHT_JSON_UNAVAILABLE', message: error instanceof Error ? error.message : String(error) });
+  }
+  return { tests, errors, blockedErrors };
 }
 
 export async function runPlaywright(
@@ -161,6 +319,22 @@ export async function runPlaywright(
   const reportJson = path.join(runDir, 'report.json');
   const reportHtml = path.join(runDir, 'html-report');
   try {
+    const acceptanceDir = env.E2ET_RUN_ACCEPTANCE_DIR;
+    if (acceptanceDir !== undefined && (path.resolve(acceptanceDir) !== runDir || env.E2ET_RUN_ID !== path.basename(runDir))) {
+      throw new AcceptanceInputError('回放子进程验收目录/运行身份不属于本次 run');
+    }
+    const acceptance = acceptanceDir === undefined ? undefined : readAcceptanceSnapshot(runDir);
+    const safeAcceptance = acceptance ? projectReportValue(acceptance).value as AcceptanceSnapshot : undefined;
+    safeAcceptance?.document.scenarios.forEach((scenario, index) => {
+      scenario.id = acceptance!.document.scenarios[index]!.id;
+      scenario.checks.forEach((check, checkIndex) => {
+        const original = acceptance!.document.scenarios[index]!.checks[checkIndex]!;
+        check.id = original.id;
+        if (check.irRef && original.irRef) check.irRef.stepId = original.irRef.stepId;
+      });
+    });
+    const receiptFile = path.join(runDir, 'run.json');
+    const receipt = fs.existsSync(receiptFile) ? JSON.parse(fs.readFileSync(receiptFile, 'utf8')) as ReportRun : undefined;
     fs.writeFileSync(tmpConfig, [
       "import { defineConfig } from '@playwright/test';",
       'export default defineConfig({',
@@ -168,7 +342,7 @@ export async function runPlaywright(
       `  testMatch: ${JSON.stringify(path.basename(testFile))},`,
       `  outputDir: ${JSON.stringify(path.join(runDir, 'test-results'))},`,
       `  timeout: ${testTimeoutMs}, retries: 0,`,
-      `  metadata: ${JSON.stringify({ e2et_version: readPackageVersion(packageRoot), playwright_version: PLAYWRIGHT_VERSION })},`,
+      `  metadata: ${JSON.stringify({ e2et_version: readPackageVersion(packageRoot), playwright_version: PLAYWRIGHT_VERSION, e2et_run: receipt, e2et_acceptance: safeAcceptance })},`,
       `  reporter: [['line'], ['json', { outputFile: ${JSON.stringify(reportJson)} }], ['html', { open: 'never', outputFolder: ${JSON.stringify(reportHtml)} }]],`,
       `  use: { headless: true, viewport: { width: 1280, height: 720 } },`,
       '});',
@@ -178,20 +352,9 @@ export async function runPlaywright(
     });
     if (result.stdout) diagnostic(result.stdout);
     if (result.stderr) diagnostic(result.stderr);
-    if (result.error) diagnostic(result.error.message);
-    const status = result.status ?? 1;
-    if (status !== 0) return status;
-    const jsonFailure = verifyReportJson(reportJson);
-    if (jsonFailure) {
-      diagnostic(`❌ verify replay 报告校验失败: ${jsonFailure}`);
-      return 1;
-    }
-    const htmlFailure = verifyReportHtml(path.join(reportHtml, 'index.html'));
-    if (htmlFailure) {
-      diagnostic(`❌ verify replay 报告校验失败: ${htmlFailure}`);
-      return 1;
-    }
-    return 0;
+    if (result.error) throw result.error;
+    if (result.signal) diagnostic(`❌ Playwright 进程由 ${result.signal} 终止`);
+    return result.status ?? 1;
   } finally { fs.rmSync(tmpConfig, { force: true }); }
 }
 

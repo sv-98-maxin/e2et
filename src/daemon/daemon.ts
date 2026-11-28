@@ -5,10 +5,12 @@
  */
 import * as net from 'node:net';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { BrowserMode, CdpSession, TransportKind } from '../browser/daemon-client.js';
 import type { CaptureMode } from '../browser/target-registry.js';
 import type { AuthMode } from '../auth-resolve.js';
-import { writeMeta, readMeta, type SessionMeta } from './session-meta.js';
+import { writeMeta, readMeta, traceDir, type SessionMeta } from './session-meta.js';
 import { appendTraceEvent, cleanupExpiredTraces, redactText, writeSessionStart, writeSessionEnd } from './trace.js';
 import { NetworkTrace } from './network-trace.js';
 import { defaultBootstrap, type BootstrapResult } from './bootstrap.js';
@@ -22,9 +24,11 @@ import { PageCommands } from './page-commands.js';
 import { EvidenceCommands } from './evidence-commands.js';
 import { TargetCoordinator } from './targets.js';
 import { OBSERVER_SCRIPT } from './observer-script.js';
+import { FlowRecorder } from './flow-recorder.js';
 import { encodeLine, parseLine, type DaemonRequest, type DaemonResponse, type DaemonWaitStarted } from './protocol.js';
 import { readPackageVersion } from '../package-version.js';
 import { requestContext, releaseRequestInputs } from '../request-context.js';
+import { AcceptanceInputError, readAcceptanceSnapshot } from '../report/acceptance.js';
 
 export interface DaemonOptions {
   env: string;
@@ -44,10 +48,30 @@ interface DaemonRuntime {
   readonly runner: ActionRunner;
   readonly evidence: EvidenceCommands;
   readonly targets: TargetCoordinator;
+  readonly flow: FlowRecorder;
   readonly pageCommands: PageCommands;
 }
 
 export async function runDaemon(sessionId: string, opts: DaemonOptions): Promise<void> {
+  try {
+    const directory = process.env.E2ET_RUN_ACCEPTANCE_DIR;
+    if (directory !== undefined && path.resolve(directory) !== path.resolve(traceDir(sessionId))) {
+      throw new AcceptanceInputError('验收快照目录不属于本次 Source 会话');
+    }
+    const acceptance = directory === undefined ? undefined : readAcceptanceSnapshot(directory);
+    if (directory !== undefined && !acceptance) throw new AcceptanceInputError('本次验收快照缺失');
+    const cliSha256 = createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex');
+    writeMeta({ id: sessionId, pid: process.pid, socket: opts.socketPath, started_at: Date.now(), env: opts.env,
+      cli_sha256: cliSha256,
+      ...(acceptance ? { acceptance_sha256: acceptance.sha256, acceptance_frozen_at: acceptance.frozenAt } : {}),
+    });
+  } catch (error) {
+    writeMeta({ id: sessionId, pid: process.pid, socket: opts.socketPath, started_at: Date.now(), env: opts.env,
+      error: redactText(error instanceof Error ? error.message : String(error)),
+      session_end: { result: 'aborted', ended_at: Date.now() },
+    });
+    throw error;
+  }
   try { cleanupExpiredTraces(sessionId); } catch { /* TTL 清理失败不阻断当前会话 */ }
 
   let cleanupPorts: CleanupPorts | null = null;
@@ -215,6 +239,8 @@ async function bringUpBootstrap(sessionId: string, opts: DaemonOptions, lifecycl
         session_id: sessionId, env: opts.env, tool_version: readPackageVersion(),
         transport: prev.transport ?? 'managed',
         ...(prev.browser_source ? { browser_source: prev.browser_source } : {}),
+        ...(prev.cli_sha256 ? { cli_sha256: prev.cli_sha256 } : {}),
+        ...(prev.acceptance_sha256 ? { acceptance_sha256: prev.acceptance_sha256, acceptance_frozen_at: prev.acceptance_frozen_at } : {}),
       });
     } catch { /* ignore */ }
     if (!prev.session_end) writeSessionEnd(sessionId, 'aborted');
@@ -242,7 +268,9 @@ async function publishSessionFacts(
     ? rawViewport as { width: number; height: number; deviceScaleFactor?: number }
     : undefined;
   const headless = bo.browserSource === 'managed' ? (process.env.E2ET_MANAGED_HEADLESS !== '0') : undefined;
+  const startup = readMeta(sessionId);
   writeMeta({
+    ...startup,
     id: sessionId, pid: process.pid, socket: opts.socketPath, tab_id: bo.tabId,
     browser_endpoint: bo.endpoint, browser_version: bo.browserVersion,
     ...(bo.browserPid ? { browser_pid: bo.browserPid } : {}),
@@ -256,6 +284,8 @@ async function publishSessionFacts(
   writeSessionStart({
     session_id: sessionId, env: opts.env, tool_version: readPackageVersion(), transport,
     browser_version: bo.browserVersion, headless,
+    ...(startup?.cli_sha256 ? { cli_sha256: startup.cli_sha256 } : {}),
+    ...(startup?.acceptance_sha256 ? { acceptance_sha256: startup.acceptance_sha256, acceptance_frozen_at: startup.acceptance_frozen_at } : {}),
     ...(viewport ? { viewport } : {}),
     ...(bo.authSource ? { auth_source: bo.authSource } : {}),
     ...(bo.browserSource ? { browser_source: bo.browserSource } : {}),
@@ -273,6 +303,7 @@ function assembleOwners(
   const trace = new NetworkTrace(sessionId, sourceSession, sourceTabId);
   holders.trace = trace;
   let page!: PageContext;
+  const flow = new FlowRecorder(sessionId, process.env, () => page.activeCdp(), () => lifecyclePorts.snapshot().stopped);
   const lazyTrace = () => holders.trace;
   const lazyObservers = () => holders.observers;
   page = new PageContext({
@@ -281,6 +312,7 @@ function assembleOwners(
     observers: lazyObservers,
     lifecycleSnapshot: lifecyclePorts.snapshot,
     onAbort: lifecyclePorts.onAbort,
+    onActivePageChanged: () => flow.onActivePageChanged(),
     trace: (event) => { try { appendTraceEvent(sessionId, event); } catch { /* trace 已结束 */ } },
   });
   const observers = new PageObservers({
@@ -309,10 +341,10 @@ function assembleOwners(
   });
   const pageCommands = new PageCommands({
     sessionId, page, observers: lazyObservers, networkTrace: lazyTrace,
-    lifecycleSnapshot: lifecyclePorts.snapshot, runner,
+    lifecycleSnapshot: lifecyclePorts.snapshot, runner, flow,
     trace: (event) => { try { appendTraceEvent(sessionId, event); } catch { /* trace 已结束 */ } },
   });
-  return { page, observers, networkTrace: trace, values, runner, evidence, targets, pageCommands };
+  return { page, observers, networkTrace: trace, values, runner, evidence, targets, flow, pageCommands };
 }
 
 /** 有限清理端口（owner stop/dispose/summary + trace flush + server/socket）。 */
@@ -322,6 +354,7 @@ function buildCleanupPorts(
   return {
     stopOwners: async () => {
       let ok = true;
+      await runtime.flow.stop();
       runtime.runner.clearDialogHandlers();
       try { await runtime.page.clearHover(); } catch { ok = false; }
       await runtime.evidence.dispose();

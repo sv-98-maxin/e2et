@@ -9,7 +9,7 @@ import { candidateToLocator, parseDeclaredWaitLocator } from '../shared/wait-loc
 import { traceRoot, e2etRoot } from '../daemon/session-meta.js';
 import { readPackageVersion } from '../package-version.js';
 import { parseTrace, readTrace, traceValueToIR, TraceVersionError, type ActionEvent, type AssertEvent, type CaptureEvent, type ParsedTrace, type RequestEvent } from './trace-reader.js';
-import { AuthSourceSchema, LocatorSchema, type IRv2, type Locator, type WithinLocator, type Wait, type Assert, type Capture, type Check, type Value, type Creates, type Frame, type ExpectEntry } from './schema.js';
+import { AuthSourceSchema, LocatorSchema, ReportRefSchema, type IRv2, type Locator, type WithinLocator, type Wait, type Assert, type Capture, type Check, type Value, type Creates, type Frame, type ExpectEntry, type ReportRef } from './schema.js';
 import { ELEMENT_PROPERTIES } from '../shared/dom-inspection.js';
 import type { ElementAssertValue } from '../shared/types.js';
 import { IR_SCHEMA_VERSION } from '../shared/versions.js';
@@ -43,6 +43,15 @@ const ACTION_SET = new Set([
   'date', 'category', 'upload', 'fill_form', 'hover', 'scroll',
   'switch_tab', 'back', 'refresh',
 ]);
+
+export function recordedReportRef(event: ActionEvent | AssertEvent | CaptureEvent): ReportRef | undefined {
+  const ref: ReportRef = {
+    ...(typeof event.group === 'string' && event.group.trim() ? { group: event.group } : {}),
+    ...(typeof event.id === 'string' && event.id.trim() ? { source_event_id: event.id } : {}),
+    ...(typeof event.check_id === 'string' && event.check_id.trim() ? { check_id: event.check_id } : {}),
+  };
+  return Object.keys(ref).length ? ref : undefined;
+}
 
 // spec 2.3 action 集合（ACTION_SET 上面已定义）
 
@@ -556,10 +565,15 @@ export async function buildIr(sessionId: string, opts: BuildOptions = {}): Promi
       catch { return { ok: false, error: { code: 'INSUFFICIENT_EVIDENCE', message: `动作 ${a.id} 的 wait_timeout_ms 非法: ${JSON.stringify(args.wait_timeout_ms)}` } }; }
       delete args.wait_timeout_ms; // step 级表达，args 不重复携带
     }
+    const actionReportRef = recordedReportRef(a);
+    if (actionReportRef && !ReportRefSchema.safeParse(actionReportRef).success) {
+      return { ok: false, error: { code: 'REPORT_METADATA', message: `动作 ${a.id} 的报告引用元数据无效` } };
+    }
     const step: IRv2['steps'][number] = {
       id: 's' + seq,
       intent: a.intent,
       action: a.kind as IRv2['steps'][number]['action'],
+      ...(actionReportRef ? { report_ref: actionReportRef } : {}),
       ...(parseFrame(a.frame) ? { frame: parseFrame(a.frame)! } : {}),
       ...(() => {
         const loc = locator;
@@ -588,6 +602,10 @@ export async function buildIr(sessionId: string, opts: BuildOptions = {}): Promi
     const checks: Check[] = [];
     for (const ev of checkEvents) {
       if (ev.after !== a.id) continue;
+      const reportRef = recordedReportRef(ev);
+      if (reportRef && !ReportRefSchema.safeParse(reportRef).success) {
+        return { ok: false, error: { code: 'REPORT_METADATA', message: `检查 ${ev.id ?? ev.after} 的报告引用元数据无效` } };
+      }
       if (ev.t === 'assert') {
         // P4 无损回放门禁：脱敏改写过期望（或旧 trace 缺真标记）的 data 断言拒绝入 IR，
         // 不补推断/默认 true；缺标记旧 data trace 必须重新录制。
@@ -595,12 +613,12 @@ export async function buildIr(sessionId: string, opts: BuildOptions = {}): Promi
           return { ok: false, error: { code: 'ASSERT_NOT_REPLAYABLE', message: `断言 ${ev.after}:data 的期望值被脱敏改写或缺少 replayable 标记，不可无损回放`, hint: '该 data 断言必须用当前 CLI 重新录制' } };
         }
         const ir = traceAssertToIR(ev, bindings, stepIdByActionId, actionsById);
-        if (ir) checks.push({ assert: ir, ...(parseFrame(ev.frame) ? { frame: parseFrame(ev.frame)! } : {}) });
+        if (ir) checks.push({ assert: ir, ...(parseFrame(ev.frame) ? { frame: parseFrame(ev.frame)! } : {}), ...(reportRef ? { report_ref: reportRef } : {}) });
         else return { ok: false, error: { code: 'INSUFFICIENT_EVIDENCE', message: `断言 ${ev.after}:${ev.kind} 无法从 trace 还原` } };
       } else {
         const ir = traceCaptureToIR(ev);
         if (ir) {
-          checks.push({ capture: ir, ...(parseFrame(ev.frame) ? { frame: parseFrame(ev.frame)! } : {}) });
+          checks.push({ capture: ir, ...(parseFrame(ev.frame) ? { frame: parseFrame(ev.frame)! } : {}), ...(reportRef ? { report_ref: reportRef } : {}) });
           if (ev.result.ok === true) bindings.set(ev.as, ev.result.value);
         } else {
           // Phase2：capture 不能漏、不能被 warning 吃掉

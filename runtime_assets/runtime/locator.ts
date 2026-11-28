@@ -7,6 +7,12 @@ import type { Locator, Frame } from './types.js';
 
 type AnyLocator = PlaywrightLocator;
 
+export interface LocatorObservation {
+  candidate: Locator;
+  candidateIndex: number;
+  matches?: number;
+}
+
 /** frame 声明 → FrameLocator 作用域。无声明返回主 Page；空描述（FrameSchema 允许 {}）无 selector 可解析，
  *  静默落回主文档会假满足，直接拒绝。 */
 export function resolveFrame(page: Page, frames?: Frame[]): FrameLocator | Page {
@@ -123,14 +129,19 @@ export async function resolveLocatorWithFallback(
   fallback: Locator[] | undefined,
   frames?: Frame[],
   timeout = 30_000,
+  observed?: (target: LocatorObservation) => void,
 ): Promise<AnyLocator> {
+  const declarations = [...(loc ? [loc] : []), ...(fallback ?? [])];
   const candidates: AnyLocator[] = [];
   if (loc) candidates.push(resolveLocator(page, loc, frames));
   if (fallback?.length) {
     for (const f of fallback) candidates.push(resolveLocator(page, f, frames));
   }
   if (candidates.length === 0) throw new Error('no locator and no fallback provided');
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) {
+    observed?.({ candidate: declarations[0]!, candidateIndex: 0 });
+    return candidates[0];
+  }
 
   if (timeout <= 0) throw new Error('❌ 预算耗尽：无法开始 fallback 定位选择');
   const deadline = Date.now() + timeout;
@@ -144,6 +155,7 @@ export async function resolveLocatorWithFallback(
       const count = await candidates[i].count();
       if (count === 1) {
         if (deadline - Date.now() <= 0) throw new Error('❌ 预算耗尽：候选唯一但预算已耗尽');
+        observed?.({ candidate: declarations[i]!, candidateIndex: i, matches: count });
         return candidates[i];
       }
       if (count > 1) throw new Error(`❌ fallback 定位歧义：候选#${i + 1} 匹配 ${count} 个节点，拒绝选择 first`);

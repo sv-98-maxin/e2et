@@ -587,6 +587,7 @@ export class ActionRunner {
       ...(plan.actionValue ? { source_action: action.id } : {}),
       ...(screenshot.path ? { screenshot_path: screenshot.path } : {}),
       ...(screenshot.error ? { screenshot_error: screenshot.error } : {}),
+      ...(screenshot.startedAt !== undefined ? { screenshot_started_at: screenshot.startedAt, screenshot_ended_at: screenshot.endedAt } : {}),
     });
     (execRes as Record<string, unknown>).__trace = trace;
     (execRes as Record<string, unknown>).__screenshot = screenshot;
@@ -709,9 +710,10 @@ export class ActionRunner {
     return { id: req.id, ok: false, error: { code: 'VALUE_CONTRACT_MISMATCH', message, hint } };
   }
 
-  private async captureScreenshotQuietly(): Promise<{ path?: string; error?: string }> {
+  private async captureScreenshotQuietly(): Promise<{ path?: string; error?: string; startedAt?: number; endedAt?: number }> {
     const cdp = this.deps.page.activeCdp();
     if (!cdp) return { error: 'NO_ACTIVE_PAGE' };
+    const startedAt = Date.now();
     try {
       const data = await captureScreenshot(cdp, false);
       const buf = Buffer.from(data, 'base64');
@@ -721,9 +723,9 @@ export class ActionRunner {
       const file = path.join(shotsDir, `${this.deps.sessionId}_${uuid}.png`);
       const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW, 0o600);
       try { fs.writeFileSync(fd, buf); } finally { fs.closeSync(fd); }
-      return { path: file };
+      return { path: file, startedAt, endedAt: Date.now() };
     } catch (e) {
-      return { error: redactText((e as Error).message) };
+      return { error: redactText((e as Error).message), startedAt, endedAt: Date.now() };
     }
   }
 

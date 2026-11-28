@@ -3,6 +3,7 @@
  * 成功与失败事件、错误码与统计保持原合同；mock.clear 不抹 history。
  */
 import type { CdpSession } from '../browser/daemon-client.js';
+import { randomUUID } from 'node:crypto';
 import { MockInterceptor } from '../browser/mock.js';
 import {
   parseAssertion, assertApi, assertRequest, assertToast, assertText, assertVisible, assertAbsent,
@@ -16,6 +17,7 @@ import type { FrameDesc } from '../browser/page-state.js';
 import { appendTraceEvent, readTraceBody, redactText, scrubValue } from './trace.js';
 import { AUTH_DATA_NOT_REPLAYABLE } from '../shared/element-value.js';
 import { REPLAY_EVIDENCE_REDACTED } from '../shared/assertion.js';
+import { REDACTED, isSensitiveKey } from '../shared/url-safety.js';
 import { ASSERT_KIND_BY_METHOD } from './session-types.js';
 import type { ActionValue } from './network-trace.js';
 import type { LifecycleSnapshot } from './session-types.js';
@@ -26,6 +28,8 @@ import type { NetworkTrace } from './network-trace.js';
 import type { SessionValues } from './session-values.js';
 import { parsePageDataSourceParams } from './page-commands.js';
 import { requestContext } from '../request-context.js';
+import { AcceptanceInputError, acceptanceCheckError, readAcceptanceSnapshot } from '../report/acceptance.js';
+import { readMeta, traceDir } from './session-meta.js';
 
 export interface EvidenceDeps {
   sessionId: string;
@@ -36,6 +40,8 @@ export interface EvidenceDeps {
   lifecycleSnapshot: () => Readonly<LifecycleSnapshot>;
   trace: (ev: Record<string, unknown>) => void;
 }
+
+type AssertionAttempt = { id: string; ts: number; executed: boolean; expect: unknown };
 
 export class EvidenceCommands {
   private assertsTotal = 0;
@@ -69,6 +75,20 @@ export class EvidenceCommands {
   private activeRefTarget(): string { return this.page.activeId() ?? this.page.sourceId(); }
 
   async handle(req: DaemonRequest): Promise<DaemonResponse> {
+    if (req.method.startsWith('assert.') && req.params?.check_id !== undefined) {
+      const after = this.nt?.getLastFinishedActionId();
+      const group = req.params.group !== undefined ? req.params.group : after ? this.nt?.getLastFinishedActionGroup() : undefined;
+      try {
+        const snapshot = readAcceptanceSnapshot(traceDir(this.deps.sessionId));
+        if (snapshot?.sha256 !== readMeta(this.deps.sessionId)?.acceptance_sha256) throw new AcceptanceInputError('验收快照与会话元数据摘要不一致');
+        const error = acceptanceCheckError(snapshot, req.params.check_id, group);
+        if (error) return this.fail(req, 'ACCEPTANCE_INPUT', error);
+        req = { ...req, params: { ...req.params, group } };
+      } catch (error) {
+        if (error instanceof AcceptanceInputError) return this.fail(req, error.code, error.message);
+        throw error;
+      }
+    }
     if (req.method.startsWith('assert.') && req.method !== 'assert.data') return this.assertCommand(req);
     if (req.method === 'assert.data') return this.assertData(req);
     if (req.method === 'capture.api' || req.method === 'capture.element') return this.capture(req);
@@ -88,21 +108,22 @@ export class EvidenceCommands {
     const assertFrameRaw = req.params?.frame !== undefined ? String(req.params.frame) : undefined;
     let assertCdp: CdpSession = cdp;
     let assertFrameDesc: FrameDesc[] | undefined;
+    const attempt: AssertionAttempt = { id: `assert_${randomUUID()}`, ts: Date.now(), executed: false, expect: req.params ?? {} };
     if (assertFrameRaw) {
-      try {
-        const ctx = await this.deps.observers()!.resolveActiveFrameContext(assertFrameRaw);
-        assertCdp = ctx.view;
-        assertFrameDesc = [ctx.desc];
-      } catch (e) {
-        if (requestContext.getStore()?.signal.aborted) return this.assertFailure(req, e, after);
-        if (e instanceof FrameUnavailableError) return this.fail(req, 'FRAME_UNSUPPORTED', e.message);
-        throw e;
-      }
       const targetParam = req.params?.target !== undefined ? String(req.params.target) : req.params?.within !== undefined ? String(req.params.within) : '';
       if (/^\[\d+\]$/.test(targetParam)) {
         return this.fail(req, 'BAD_REQUEST', 'frame 内不支持 [N] 索引（无 frame 快照），先用 css=/role=/label=/text= 定位');
       }
     }
+    const prepareRead = async (): Promise<void> => {
+      attempt.executed = true;
+      if (assertFrameRaw && !assertFrameDesc) {
+        const ctx = await this.deps.observers()!.resolveActiveFrameContext(assertFrameRaw);
+        assertCdp = ctx.view;
+        assertFrameDesc = [ctx.desc];
+        deps.cdp = assertCdp;
+      }
+    };
     const deps: AssertDeps = {
       cdp: assertCdp,
       resolveReq: (ref: string) => nt.resolveReqRef(ref),
@@ -131,17 +152,21 @@ export class EvidenceCommands {
             }
             const header = String(req.params?.header ?? '');
             if (!header) return this.fail(req, 'BAD_REQUEST', '缺 --header');
+            if (!parseAssertion(header)) return this.fail(req, 'BAD_REQUEST', '--header 需要 "<path> <op> <value>"');
+            await prepareRead();
             result = await assertApiHeader(deps, reqRef, header);
             break;
           }
           const expect = String(req.params?.expect ?? '');
           if (!expect) return this.fail(req, 'BAD_REQUEST', '缺 --expect');
+          if (!parseAssertion(expect)) return this.fail(req, 'BAD_REQUEST', '--expect 需要 "<path> <op> <value>"');
           const source = this.deps.values.parseAssertValueSource(req.params);
           if (!source.ok) return this.fail(req, source.error.code, source.error.message, source.error.hint);
           if (source.value !== undefined && parseAssertion(expect)?.valueJson) {
             return this.fail(req, 'BAD_REQUEST', '引用模式（--value-ref/--value-from-action）下 --expect 只能给 "<path> <op>"，不能同时携带 literal 文本');
           }
           assertValueMeta = source.meta;
+          await prepareRead();
           result = await assertApi(deps, reqRef, expect, source.value);
           break;
         }
@@ -153,18 +178,21 @@ export class EvidenceCommands {
           const body = String(hasBody ? req.params?.body : req.params?.query);
           if (!reqRef) return this.fail(req, 'BAD_REQUEST', '缺 req 引用');
           if (!body) return this.fail(req, 'BAD_REQUEST', hasBody ? '缺 --body' : '缺 --query');
+          if (!parseAssertion(body)) return this.fail(req, 'BAD_REQUEST', '请求断言需要 "<path> <op> <value>"');
           const source = this.deps.values.parseAssertValueSource(req.params);
           if (!source.ok) return this.fail(req, source.error.code, source.error.message, source.error.hint);
           if (source.value !== undefined && parseAssertion(body)?.valueJson) {
             return this.fail(req, 'BAD_REQUEST', `引用模式（--value-ref/--value-from-action）下 ${hasBody ? '--body' : '--query'} 只能给 "<path> <op>"，不能同时携带 literal 文本`);
           }
           assertValueMeta = source.meta;
+          await prepareRead();
           result = await assertRequest(deps, reqRef, body, source.value, hasQuery ? 'query' : 'body');
           break;
         }
         case 'assert.toast': {
           const text = String(req.params?.text ?? '');
           if (!text) return this.fail(req, 'BAD_REQUEST', '缺 text');
+          await prepareRead();
           result = await assertToast(deps, text);
           break;
         }
@@ -180,18 +208,21 @@ export class EvidenceCommands {
           const resolved = source.value;
           if (resolved === undefined || !resolved.trim()) return this.fail(req, 'BAD_REQUEST', 'assert text 期望值为空或纯空白');
           assertValueMeta = source.meta;
+          await prepareRead();
           result = await assertText(deps, resolved, req.params?.within !== undefined ? String(req.params.within) : undefined);
           break;
         }
         case 'assert.visible': {
           const target = String(req.params?.target ?? '');
           if (!target) return this.fail(req, 'BAD_REQUEST', '缺 target');
+          await prepareRead();
           result = await assertVisible(deps, target);
           break;
         }
         case 'assert.absent': {
           const target = String(req.params?.target ?? '');
           if (!target) return this.fail(req, 'BAD_REQUEST', '缺 target');
+          await prepareRead();
           result = await assertAbsent(deps, target);
           break;
         }
@@ -199,6 +230,8 @@ export class EvidenceCommands {
           const contains = String(req.params?.contains ?? '');
           const count = req.params?.count !== undefined ? Number(req.params.count) : undefined;
           if (!contains) return this.fail(req, 'BAD_REQUEST', '缺 contains');
+          if (count !== undefined && (!Number.isInteger(count) || count < 0)) return this.fail(req, 'BAD_REQUEST', '--count 必须是非负整数');
+          await prepareRead();
           result = await assertTableRow(deps, contains, count);
           break;
         }
@@ -208,6 +241,7 @@ export class EvidenceCommands {
           const source = this.deps.values.parseAssertValueSource(req.params, true);
           if (!source.ok) return this.fail(req, source.error.code, source.error.message, source.error.hint);
           assertValueMeta = source.meta;
+          await prepareRead();
           result = await assertField(deps, label, source.value ?? '');
           break;
         }
@@ -219,6 +253,7 @@ export class EvidenceCommands {
           if (!target) return this.fail(req, 'BAD_REQUEST', '缺 target');
           if (!property) return this.fail(req, 'BAD_REQUEST', '缺 --property');
           if (pseudoRaw !== undefined && pseudoRaw !== 'before' && pseudoRaw !== 'after') return this.fail(req, 'BAD_REQUEST', '--pseudo 只支持 before|after');
+          await prepareRead();
           result = await assertStyle(deps, target, { property, equals, ...(pseudoRaw ? { pseudo: pseudoRaw as 'before' | 'after' } : {}), ...(req.params?.all === true ? { all: true } : {}) });
           break;
         }
@@ -230,6 +265,7 @@ export class EvidenceCommands {
           if (!property) return this.fail(req, 'BAD_REQUEST', '缺 --property');
           const parsed = expectRaw.match(/^(==|!=|exists|contains|>|<)\s*(.*)$/);
           if (!parsed) return this.fail(req, 'BAD_REQUEST', '--expect 需要 "<op> <value>"');
+          await prepareRead();
           result = await assertElement(deps, target, { property, op: parsed[1] as '==' | '!=' | 'exists' | 'contains' | '>' | '<', value: parseValue(parsed[2].trim()), ...(req.params?.all === true ? { all: true } : {}) });
           break;
         }
@@ -251,22 +287,22 @@ export class EvidenceCommands {
             if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) return this.fail(req, 'BAD_REQUEST', '--count 必须是非负整数');
             check = { level: level as (typeof levels)[number], contains, count };
           }
+          await prepareRead();
           const observers = this.deps.observers()!;
           await this.attachConsoleIfNeeded(observers);
           requestContext.getStore()?.signal.throwIfAborted();
-          if (!observers.hasActiveConsole()) return this.fail(req, 'NOT_READY', 'Console 观察器未就绪');
+          if (!observers.hasActiveConsole()) throw Object.assign(new Error('Console 观察器未就绪'), { code: 'NOT_READY' });
           let frameId: string | undefined;
           if (assertFrameRaw) {
             try { frameId = (await observers.resolveActiveFrameContext(assertFrameRaw)).frameId; }
             catch (e) {
               requestContext.getStore()?.signal.throwIfAborted();
-              if (e instanceof FrameUnavailableError) return this.fail(req, 'FRAME_UNSUPPORTED', e.message);
               throw e;
             }
           }
           const consoleSnap = await observers.consoleSnapshot();
           requestContext.getStore()?.signal.throwIfAborted();
-          if (!consoleSnap) return this.fail(req, 'NOT_READY', 'Console 观察器未就绪');
+          if (!consoleSnap) throw Object.assign(new Error('Console 观察器未就绪'), { code: 'NOT_READY' });
           const actionId = scopeRaw === 'action' ? (nt.getActiveActionId() ?? after) : undefined;
           if (scopeRaw === 'action' && !actionId) return this.fail(req, 'BAD_REQUEST', 'action scope 需要已完成/进行中的 action 身份');
           const match = matchConsole(consoleSnap.snapshot, check, { scope: scopeRaw, ...(actionId ? { actionId } : {}), ...(frameId ? { frameId } : {}) });
@@ -282,6 +318,7 @@ export class EvidenceCommands {
         case 'assert.url': {
           const contains = String(req.params?.contains ?? '');
           if (!contains) return this.fail(req, 'BAD_REQUEST', '缺 contains');
+          await prepareRead();
           result = await assertUrl(deps, contains);
           break;
         }
@@ -290,13 +327,11 @@ export class EvidenceCommands {
       }
       requestContext.getStore()?.signal.throwIfAborted();
     } catch (e) {
-      return this.assertFailure(req, e, after);
+      return this.assertFailure(req, e, after, attempt);
     }
-    this.assertsTotal++;
-    if (result.pass) this.assertsPass++;
     if (result.target) this.page.updateRefIdentity(result.target);
     if (result.within) this.page.updateRefIdentity(result.within);
-    appendTraceEvent(this.deps.sessionId, {
+    this.recordAssertion(req, attempt, {
       t: 'assert', after, kind: result.kind, expect: result.expect, actual: result.actual, pass: result.pass, evidence: result.evidence,
       ...(result.target ? { target: result.target } : {}),
       ...(result.within ? { within: result.within } : {}),
@@ -321,33 +356,47 @@ export class EvidenceCommands {
     }
   }
 
-  private assertFailure(req: DaemonRequest, e: unknown, after: string): DaemonResponse {
+  private recordAssertion(req: DaemonRequest, attempt: AssertionAttempt, event: Record<string, unknown>): void {
+    this.assertsTotal++;
+    if (event.pass === true) this.assertsPass++;
+    appendTraceEvent(this.deps.sessionId, {
+      ...event, id: attempt.id, ts: attempt.ts, ts_end: Date.now(), executed: attempt.executed,
+      status: event.status ?? (event.pass === true ? 'pass' : 'fail'),
+      ...(req.params?.check_id !== undefined ? { check_id: req.params.check_id } : {}),
+      ...(req.params?.group !== undefined ? { group: req.params.group } : {}),
+    });
+  }
+
+  private assertFailure(req: DaemonRequest, e: unknown, after: string, attempt?: AssertionAttempt): DaemonResponse {
     const signal = requestContext.getStore()?.signal;
-    if (signal?.aborted) {
-      const code = 'REQUEST_CANCELLED';
-      const kind = ASSERT_KIND_BY_METHOD[req.method] ?? req.method.slice('assert.'.length);
-      this.assertsTotal++;
-      appendTraceEvent(this.deps.sessionId, {
-        t: 'assert', after, kind, expect: null, actual: { error: { code } }, pass: false, replayable: false, evidence: [{ code }],
-        ...(req.params?.group !== undefined ? { group: String(req.params.group) } : {}),
+    const msg = e instanceof Error ? e.message : String(e);
+    const code = signal?.aborted ? 'REQUEST_CANCELLED' : e instanceof FrameUnavailableError ? 'FRAME_UNSUPPORTED'
+      : msg === AUTH_DATA_NOT_REPLAYABLE ? AUTH_DATA_NOT_REPLAYABLE
+      : msg.startsWith(REPLAY_EVIDENCE_REDACTED) ? REPLAY_EVIDENCE_REDACTED
+      : msg.startsWith('INSUFFICIENT_EVIDENCE') ? 'INSUFFICIENT_EVIDENCE'
+      : msg.startsWith('BODY_UNAVAILABLE') ? 'BODY_UNAVAILABLE'
+      : msg.startsWith('BAD_REQUEST') ? 'BAD_REQUEST' : e instanceof InvalidRefError ? 'NOT_FOUND'
+      : typeof (e as { code?: unknown })?.code === 'string' ? (e as { code: string }).code : 'DAEMON_ERROR';
+    const message = signal?.aborted ? signal.reason.message
+      : code === AUTH_DATA_NOT_REPLAYABLE ? '字段为凭证通道（密码控件），拒绝读取'
+      : code === REPLAY_EVIDENCE_REDACTED ? '断言依赖被脱敏改写的来源字段，拒绝回放' : redactText(msg);
+    if (attempt?.executed && code !== 'BAD_REQUEST') {
+      const expression = req.method === 'assert.api' ? req.params?.header ?? req.params?.expect
+        : req.method === 'assert.request' ? req.params?.query ?? req.params?.body : undefined;
+      const credentialPath = typeof expression === 'string' ? parseAssertion(expression)?.path : undefined;
+      const credentialFailure = msg === AUTH_DATA_NOT_REPLAYABLE || msg.startsWith(REPLAY_EVIDENCE_REDACTED)
+        || (e as { code?: unknown })?.code === AUTH_DATA_NOT_REPLAYABLE || (e as { code?: unknown })?.code === REPLAY_EVIDENCE_REDACTED
+        || (credentialPath !== undefined && isSensitiveKey(credentialPath));
+      this.recordAssertion(req, attempt, {
+        t: 'assert', after, kind: ASSERT_KIND_BY_METHOD[req.method] ?? req.method.slice('assert.'.length),
+        expect: credentialFailure ? REDACTED : scrubValue(attempt.expect), actual: { error: { code, message } }, error: { code, message },
+        status: 'error', pass: false, replayable: false, evidence: [{ code }],
+        ...(req.params?.frame !== undefined ? { frame: req.params.frame } : {}),
       });
-      return this.fail(req, code, signal.reason.message);
     }
-    const msg = (e as Error).message;
-    if (msg.startsWith('INSUFFICIENT_EVIDENCE')) return this.fail(req, 'INSUFFICIENT_EVIDENCE', redactText(msg));
-    if (msg === AUTH_DATA_NOT_REPLAYABLE || msg.startsWith(REPLAY_EVIDENCE_REDACTED)) {
-      const code = msg === AUTH_DATA_NOT_REPLAYABLE ? AUTH_DATA_NOT_REPLAYABLE : REPLAY_EVIDENCE_REDACTED;
-      const kind = ASSERT_KIND_BY_METHOD[req.method] ?? String(req.method);
-      this.assertsTotal++;
-      appendTraceEvent(this.deps.sessionId, { t: 'assert', after, kind, expect: '[REDACTED]', actual: { error: { code } }, pass: false, replayable: false, evidence: [{ code }] });
-      return this.fail(req, code, code === AUTH_DATA_NOT_REPLAYABLE ? '字段为凭证通道（密码控件），拒绝读取' : '断言依赖被脱敏改写的来源字段，拒绝回放');
-    }
-    if (msg.startsWith('BODY_UNAVAILABLE')) {
-      return this.fail(req, 'BODY_UNAVAILABLE', redactText(msg), '请求 body 未存进 trace(可能响应未结束或非 JSON)；若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线');
-    }
-    if (msg.startsWith('BAD_REQUEST')) return this.fail(req, 'BAD_REQUEST', redactText(msg));
-    if (e instanceof InvalidRefError) return this.fail(req, 'NOT_FOUND', redactText(msg), '切换/关闭/新快照后旧 ref 失效，先 page state 刷新');
-    return this.fail(req, 'DAEMON_ERROR', redactText(msg));
+    const hint = code === 'NOT_FOUND' ? '切换/关闭/新快照后旧 ref 失效，先 page state 刷新'
+      : code === 'BODY_UNAVAILABLE' ? '请求 body 未存进 trace(可能响应未结束或非 JSON)；若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线' : undefined;
+    return this.fail(req, code, message, hint);
   }
 
   // ── assert.data ──
@@ -368,27 +417,27 @@ export class EvidenceCommands {
     const equalsScrubbed = scrubValue(expected, pageDataScrubKey(parsed.source)) as string | number | boolean | null;
     const group = req.params?.group !== undefined ? String(req.params.group) : undefined;
     const frameDescRaw = req.params?.frame !== undefined ? String(req.params.frame) : undefined;
+    const attempt: AssertionAttempt = { id: `assert_${randomUUID()}`, ts: Date.now(), executed: true, expect: { source: parsed.source, equals: equalsScrubbed } };
     let dataFrame: import('./page-observers.js').PageDataFrame | undefined;
     if (frameDescRaw) {
       try { dataFrame = await this.deps.observers()!.resolvePageDataFrame(frameDescRaw); }
       catch (e) {
-        if (requestContext.getStore()?.signal.aborted) return this.assertFailure(req, e, after);
-        if (e instanceof FrameUnavailableError) return this.fail(req, 'FRAME_UNSUPPORTED', e.message);
-        throw e;
+        return this.assertFailure(req, e, after, attempt);
       }
     }
     const dataFrameDesc = dataFrame ? [dataFrame.desc] : undefined;
-    const read = await this.deps.observers()!.readPageDataObserved(parsed.source, { after, group }, dataFrame);
+    let read: Awaited<ReturnType<PageObservers['readPageDataObserved']>>;
+    try { read = await this.deps.observers()!.readPageDataObserved(parsed.source, { after, group }, dataFrame); }
+    catch (error) { return this.assertFailure(req, error, after, attempt); }
     const signal = requestContext.getStore()?.signal;
-    if (signal?.aborted) return this.assertFailure(req, signal.reason, after);
+    if (signal?.aborted) return this.assertFailure(req, signal.reason, after, attempt);
     const replayable = equalsScrubbed === expected && (read.ok ? read.replayable : false) === true;
     if (!read.ok) {
-      this.assertsTotal++;
-      appendTraceEvent(this.deps.sessionId, {
+      this.recordAssertion(req, attempt, {
         t: 'assert', after, kind: 'data',
         expect: { source: parsed.source, equals: equalsScrubbed },
         actual: { error: { code: read.code, message: read.message } },
-        pass: false, replayable,
+        pass: false, status: 'error', replayable,
         evidence: [{ observation: read.observationId, error: { code: read.code } }],
         observation_ref: read.observationId,
         ...(dataFrameDesc ? { frame: dataFrameDesc } : {}),
@@ -397,11 +446,9 @@ export class EvidenceCommands {
       return this.fail(req, read.code, read.message, read.hint);
     }
     const pass = read.value.present && read.value.value === expected;
-    this.assertsTotal++;
-    if (pass) this.assertsPass++;
     const actual = { present: read.value.present, ...(read.result.value !== undefined ? { value: read.result.value } : {}), context: read.context };
     const expectShown = { source: parsed.source, equals: equalsScrubbed };
-    appendTraceEvent(this.deps.sessionId, {
+    this.recordAssertion(req, attempt, {
       t: 'assert', after, kind: 'data', expect: expectShown, actual, pass, replayable,
       evidence: [{ observation: read.observationId }], observation_ref: read.observationId,
       ...(dataFrameDesc ? { frame: dataFrameDesc } : {}),
@@ -424,6 +471,9 @@ export class EvidenceCommands {
     if (!after) return this.fail(req, 'BAD_REQUEST', 'capture 必须跟在操作命令之后', '先执行 page click/fill 等操作');
     const as = String(req.params?.as ?? '');
     if (!as) return this.fail(req, 'BAD_REQUEST', '缺 --as 变量名');
+    if (req.method === 'capture.api' && (!req.params?.req || !req.params?.path)) return this.fail(req, 'BAD_REQUEST', '缺 req 引用或 path');
+    if (req.method === 'capture.element' && !req.params?.target) return this.fail(req, 'BAD_REQUEST', '缺 target');
+    const attempt = { id: `capture_${randomUUID()}`, ts: Date.now() };
     const captureFrameRaw = req.params?.frame !== undefined ? String(req.params.frame) : undefined;
     let captureCdp: CdpSession = cdp;
     let captureFrameDesc: FrameDesc[] | undefined;
@@ -435,9 +485,7 @@ export class EvidenceCommands {
         captureCdp = ctx.view;
         captureFrameDesc = [ctx.desc];
       } catch (e) {
-        if (requestContext.getStore()?.signal.aborted) return this.captureFailure(req, e, after, as);
-        if (e instanceof FrameUnavailableError) return this.fail(req, 'FRAME_UNSUPPORTED', e.message);
-        throw e;
+        return this.captureFailure(req, e, after, as, attempt);
       }
     }
     const cdeps: CaptureDeps = {
@@ -467,12 +515,12 @@ export class EvidenceCommands {
       }
       requestContext.getStore()?.signal.throwIfAborted();
     } catch (e) {
-      return this.captureFailure(req, e, after, as);
+      return this.captureFailure(req, e, after, as, attempt);
     }
     this.deps.values.setVar(as, { value: captured.value, origin: captured.lineage === 'created' || captured.lineage === 'generated' ? 'captured' : 'literal' });
     if (captured.target) this.page.updateRefIdentity(captured.target);
     appendTraceEvent(this.deps.sessionId, {
-      t: 'capture', after, as: captured.as, replayable: true,
+      t: 'capture', id: attempt.id, ts: attempt.ts, ts_end: Date.now(), executed: true, status: 'pass', after, as: captured.as, replayable: true,
       result: {
         ok: true, value: captured.value, from: captured.from, lineage: captured.lineage,
         ...(req.method === 'capture.api' ? { path: String(req.params?.path ?? '') } : {}),
@@ -485,32 +533,29 @@ export class EvidenceCommands {
     return this.ok(req, { ...captured });
   }
 
-  private captureFailure(req: DaemonRequest, e: unknown, after: string, as: string): DaemonResponse {
+  private captureFailure(req: DaemonRequest, e: unknown, after: string, as: string, attempt: { id: string; ts: number }): DaemonResponse {
     const signal = requestContext.getStore()?.signal;
-    if (signal?.aborted) {
-      const code = 'REQUEST_CANCELLED';
+    const msg = e instanceof Error ? e.message : String(e);
+    const code = signal?.aborted ? 'REQUEST_CANCELLED' : e instanceof FrameUnavailableError ? 'FRAME_UNSUPPORTED'
+      : msg === AUTH_DATA_NOT_REPLAYABLE ? AUTH_DATA_NOT_REPLAYABLE
+      : msg.startsWith(REPLAY_EVIDENCE_REDACTED) ? REPLAY_EVIDENCE_REDACTED
+      : msg.startsWith('INSUFFICIENT_EVIDENCE') ? 'INSUFFICIENT_EVIDENCE'
+      : msg.startsWith('BODY_UNAVAILABLE') ? 'BODY_UNAVAILABLE'
+      : msg.startsWith('BAD_REQUEST') ? 'BAD_REQUEST' : e instanceof InvalidRefError ? 'NOT_FOUND' : 'DAEMON_ERROR';
+    const message = signal?.aborted ? signal.reason.message
+      : code === AUTH_DATA_NOT_REPLAYABLE ? '目标为凭证通道（密码控件），拒绝读取'
+      : code === REPLAY_EVIDENCE_REDACTED ? 'capture 依赖被脱敏改写的来源字段，拒绝回放' : redactText(msg);
+    if (code !== 'BAD_REQUEST') {
       appendTraceEvent(this.deps.sessionId, {
-        t: 'capture', after, as, replayable: false, result: { ok: false, error: { code } },
+        t: 'capture', id: attempt.id, ts: attempt.ts, ts_end: Date.now(), executed: true, status: 'error',
+        after, as, replayable: false, result: { ok: false, error: { code, message } },
+        args: req.params,
         ...(req.params?.group !== undefined ? { group: String(req.params.group) } : {}),
       });
-      return this.fail(req, code, signal.reason.message);
     }
-    const msg = (e as Error).message;
-    if (msg.startsWith('INSUFFICIENT_EVIDENCE')) return this.fail(req, 'INSUFFICIENT_EVIDENCE', redactText(msg));
-    if (msg === AUTH_DATA_NOT_REPLAYABLE || msg.startsWith(REPLAY_EVIDENCE_REDACTED)) {
-      const code = msg === AUTH_DATA_NOT_REPLAYABLE ? AUTH_DATA_NOT_REPLAYABLE : REPLAY_EVIDENCE_REDACTED;
-      appendTraceEvent(this.deps.sessionId, {
-        t: 'capture', after, as, replayable: false, result: { ok: false, error: { code } },
-        ...(req.params?.group !== undefined ? { group: String(req.params.group) } : {}),
-      });
-      return this.fail(req, code, code === AUTH_DATA_NOT_REPLAYABLE ? '目标为凭证通道（密码控件），拒绝读取' : 'capture 依赖被脱敏改写的来源字段，拒绝回放');
-    }
-    if (msg.startsWith('BODY_UNAVAILABLE')) {
-      return this.fail(req, 'BODY_UNAVAILABLE', redactText(msg), '若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线');
-    }
-    if (msg.startsWith('BAD_REQUEST')) return this.fail(req, 'BAD_REQUEST', redactText(msg));
-    if (e instanceof InvalidRefError) return this.fail(req, 'NOT_FOUND', redactText(msg), '切换/关闭/新快照后旧 ref 失效，先 page state 刷新');
-    return this.fail(req, 'DAEMON_ERROR', redactText(msg));
+    const hint = code === 'NOT_FOUND' ? '切换/关闭/新快照后旧 ref 失效，先 page state 刷新'
+      : code === 'BODY_UNAVAILABLE' ? '若已确认目标站未登录，先核自己Chrome的目标页：仍已登录则直接 e2et auth import --chrome --url <目标业务URL>；也未登录则请用户在自己的Chrome登录，完成后再复制profile；保留失败证据，结束旧会话，新会话/回放显式 --auth profile --browser chrome；只有profile复制或复用确实不可用时选择 e2et auth login --url <目标业务URL>，新登录可能使原Chrome下线' : undefined;
+    return this.fail(req, code, message, hint);
   }
 
   // ── mock ──

@@ -10,17 +10,82 @@ import type { ValueContext } from './value.js';
 import type { RequestTracker } from './request-tracker.js';
 import { resolveFrame, resolveFrameObject, resolveLocator } from './locator.js';
 import { readPageDataSource } from './page-data.js';
-import { jsonPath, compare, compareQuery, queryParamValues, REPLAY_EVIDENCE_REDACTED, type AssertOp as SharedAssertOp } from './shared/assertion.js';
+import { jsonPath, diagnoseMissingPath, compare, compareQuery, queryParamValues, REPLAY_EVIDENCE_REDACTED, type AssertOp as SharedAssertOp } from './shared/assertion.js';
 import { REDACTED, isSensitiveKey, redactUrlWithEvidence } from './shared/url-safety.js';
 import { readComputedStyle, readElementProperty } from './shared/dom-inspection.js';
 import { matchConsole, type ConsoleCheck } from './shared/console.js';
+import type { ReportEvent } from './shared/report-model.js';
+import { AUTH_DATA_NOT_REPLAYABLE, readElementValue, type ElementValue } from './shared/element-value.js';
 
 export interface AssertionResult {
+  type?: 'assert' | 'capture';
   kind: string;
   expect: unknown;
-  actual: unknown;
+  actual?: unknown;
   pass: boolean;
   executed: boolean;
+  checkId?: string;
+  resolvedExpected?: unknown;
+  actualStatus?: ReportEvent['actualStatus'];
+  status?: ReportEvent['status'];
+  checkIndex?: number;
+  entryIndex?: number;
+  startedAt?: number;
+  endedAt?: number;
+  group?: string;
+  frame?: unknown;
+  target?: unknown;
+  evidence?: unknown;
+  valueSource?: unknown;
+  error?: ReportEvent['error'];
+}
+
+function checkResults(check: Check, checkIndex: number): AssertionResult[] {
+  const assertion = 'assert' in check ? check.assert : undefined;
+  const entries = assertion && ('api' in assertion ? assertion.expect ?? assertion.header
+    : 'request' in assertion ? assertion.body ?? assertion.query : undefined);
+  const declarations = entries?.map(entry => ({
+    req: assertion && 'api' in assertion ? assertion.api : assertion && 'request' in assertion ? assertion.request : undefined,
+    channel: assertion && 'api' in assertion ? assertion.header !== undefined ? 'response_header' : 'response_body'
+      : assertion && 'request' in assertion && assertion.query !== undefined ? 'request_query' : 'request_body',
+    ...entry,
+  })) ?? [assertion ?? ('capture' in check ? check.capture : undefined)];
+  return declarations.map((expect, entryIndex) => ({
+    type: assertion ? 'assert' : 'capture',
+    kind: kindOf(check),
+    expect,
+    pass: false,
+    executed: false,
+    status: 'not_run',
+    actualStatus: 'not_collected',
+    checkIndex,
+    entryIndex,
+    ...(check.report_ref?.check_id ? { checkId: check.report_ref.check_id } : {}),
+    ...(check.report_ref?.group ? { group: check.report_ref.group } : {}),
+    ...(check.frame ? { frame: check.frame } : {}),
+  }));
+}
+
+export function notRunChecks(checks: Check[]): AssertionResult[] {
+  return checks.flatMap((check, index) => checkResults(check, index));
+}
+
+function beginResult(result: AssertionResult): void {
+  result.startedAt = Date.now();
+  result.executed = true;
+  result.status = 'error';
+  result.actualStatus = 'unavailable';
+}
+
+function recordActual(result: AssertionResult, actual: unknown): void {
+  if (actual !== undefined) result.actual = actual;
+  result.actualStatus = actual === undefined ? 'missing' : 'present';
+}
+
+function finishResult(result: AssertionResult, pass: boolean): void {
+  result.pass = pass;
+  result.status = pass ? 'pass' : 'fail';
+  result.endedAt = Date.now();
 }
 
 export async function executeChecks(
@@ -36,23 +101,25 @@ export async function executeChecks(
   for (let index = 0; index < list.length; index++) {
     const check = list[index]!;
     const remaining = Math.max(0, timeout - (Date.now() - start));
-    let recorded = false;
+    const rows = checkResults(check, index);
+    results.push(...rows);
+    const observed = rows[0]!;
+    beginResult(observed);
     try {
       if ('assert' in check) {
-        const result = await executeAssert(page, check.assert, vctx, reqTracker, remaining, check.frame);
-        results.push(result);
-        recorded = true;
+        const result = await executeAssert(page, check.assert, vctx, reqTracker, remaining, observed, rows, check.frame);
+        Object.assign(observed, result);
+        if (observed.status === 'error') finishResult(observed, result.pass);
         if (!result.pass) throw new Error(`❌ ${result.kind} 断言失败`);
       } else if ('capture' in check) {
-        await executeCapture(page, check.capture, vctx, reqTracker, remaining, check.frame);
+        await executeCapture(page, check.capture, vctx, reqTracker, remaining, observed, check.frame);
+        finishResult(observed, true);
       }
     } catch (error) {
-      if (!recorded) {
-        results.push({ kind: kindOf(check), expect: 'assert' in check ? check.assert : check.capture, actual: { error: (error as Error).message }, pass: false, executed: 'assert' in check });
-      }
-      for (const rest of list.slice(index + 1)) {
-        results.push({ kind: kindOf(rest), expect: 'assert' in rest ? rest.assert : rest.capture, actual: null, pass: false, executed: false });
-      }
+      const failed = rows.find(row => row.status === 'fail' || row.status === 'error') ?? observed;
+      failed.error = { message: error instanceof Error ? error.message : String(error) };
+      failed.endedAt = Date.now();
+      for (let rest = index + 1; rest < list.length; rest++) results.push(...checkResults(list[rest]!, rest));
       throw error;
     }
   }
@@ -60,7 +127,7 @@ export async function executeChecks(
 
 function kindOf(check: Check): string {
   if ('assert' in check) return Object.keys(check.assert)[0] ?? 'assert';
-  return 'capture';
+  return 'from_api' in check.capture ? 'from_api' : 'from_element';
 }
 
 async function executeAssert(
@@ -69,14 +136,19 @@ async function executeAssert(
   vctx: ValueContext,
   reqTracker: RequestTracker,
   timeout: number,
+  observed: AssertionResult,
+  rows: AssertionResult[],
   frames?: import('./types.js').Frame[],
 ): Promise<AssertionResult> {
   // assert.api（响应体完成驱动：请求可能延后发起，body 真正完成才判定）
   if ('api' in assert) {
     const rec = await reqTracker.waitForComplete(page, assert.api, timeout);
+    observed.evidence = { req: assert.api, method: rec.method, status: rec.status };
     if (assert.header !== undefined) {
-      const actuals: Array<{ path: string; actual: unknown }> = [];
-      for (const entry of assert.header as ExpectEntry[]) {
+      for (const [index, entry] of assert.header.entries()) {
+        const row = rows[index]!;
+        if (index > 0) beginResult(row);
+        row.evidence = observed.evidence;
         const name = entry.path.toLowerCase();
         if (isSensitiveKey(name)) throw new Error(`${REPLAY_EVIDENCE_REDACTED}: 响应头名敏感`);
         if (!rec.responseHeaders || !Array.isArray(rec.responseHeadersRedacted)) {
@@ -93,49 +165,61 @@ async function executeAssert(
         const expected = 'value_ref' in entry ? vctx.resolve({ ref: entry.value_ref })
           : 'value_from_action' in entry ? vctx.resolve({ from_action: entry.value_from_action })
           : entry.value;
-        actuals.push({ path: name, actual: actual ?? null });
-        if (!compare(mapOp(entry.op), actual, expected)) {
+        row.resolvedExpected = expected;
+        recordActual(row, actual);
+        finishResult(row, compare(mapOp(entry.op), actual, expected));
+        if (!row.pass) {
           throw new Error(`❌ header ${name} ${entry.op}: 期望=${JSON.stringify(expected)}，实际=${JSON.stringify(actual)}`);
         }
       }
       console.log(`✅ assert.api header: ${assert.api.path}`);
-      return { kind: 'api', expect: { header: assert.header }, actual: actuals, pass: true, executed: true };
+      return observed;
     }
     const body = parseBodyOrThrow(rec.body, assert.api.path);
-    const actuals: Array<{ path: string; actual: unknown }> = [];
-    for (const entry of assert.expect as ExpectEntry[]) {
+    for (const [index, entry] of (assert.expect as ExpectEntry[]).entries()) {
+      const row = rows[index]!;
+      if (index > 0) beginResult(row);
+      row.evidence = observed.evidence;
       const sharedOp = mapOp(entry.op);
       const expected = 'value_ref' in entry ? vctx.resolve({ ref: entry.value_ref })
         : 'value_from_action' in entry ? vctx.resolve({ from_action: entry.value_from_action })
         : entry.value;
+      row.resolvedExpected = expected;
       const actual = jsonPath(body, entry.path);
-      actuals.push({ path: entry.path, actual: actual === undefined ? null : actual });
+      recordActual(row, actual);
+      if (actual === undefined) row.evidence = { ...row.evidence as object, ...diagnoseMissingPath(body, entry.path) };
       // missing(actual===undefined) 对所有 shared op 返回 false，ne 不假绿
-      if (!compare(sharedOp, actual, expected)) {
+      finishResult(row, compare(sharedOp, actual, expected));
+      if (!row.pass) {
         throw new Error(`❌ ${entry.path} ${entry.op}: 期望=${JSON.stringify(expected)}，实际=${JSON.stringify(actual)}`);
       }
     }
     console.log(`✅ assert.api: ${assert.api.path}`);
-    return { kind: 'api', expect: assert.expect, actual: actuals, pass: true, executed: true };
+    return observed;
   }
 
   // assert.request
   if ('request' in assert) {
     const rec = reqTracker.query(assert.request.path, assert.request.nav, assert.request.call_index);
     if (!rec) throw new Error(`❌ assert.request: 请求 {path:${assert.request.path},nav:${assert.request.nav},call_index:${assert.request.call_index}} 未找到`);
-    const actuals: Array<{ path: string; actual: unknown }> = [];
+    observed.evidence = { req: assert.request, method: rec.method, status: rec.status };
     if (assert.query !== undefined) {
       // 与 Source 同义：来源 URL 实际被脱敏改写就不允许 query 断言，且不回显 raw URL。
       if (redactUrlWithEvidence(rec.url).redacted) throw new Error(`${REPLAY_EVIDENCE_REDACTED}: 来源 URL 已被实际脱敏改写`);
-      for (const entry of assert.query as ExpectEntry[]) {
+      for (const [index, entry] of assert.query.entries()) {
+        const row = rows[index]!;
+        if (index > 0) beginResult(row);
+        row.evidence = observed.evidence;
         if (isSensitiveKey(entry.path)) throw new Error(`${REPLAY_EVIDENCE_REDACTED}: query 键名敏感`);
         const sharedOp = mapOp(entry.op);
         const expected = 'value_ref' in entry ? vctx.resolve({ ref: entry.value_ref })
           : 'value_from_action' in entry ? vctx.resolve({ from_action: entry.value_from_action })
           : entry.value;
+        row.resolvedExpected = expected;
         const actual = queryParamValues(rec.url, entry.path);
-        actuals.push({ path: entry.path, actual: actual ?? null });
-        if (!compareQuery(sharedOp, actual, expected)) {
+        recordActual(row, actual);
+        finishResult(row, compareQuery(sharedOp, actual, expected));
+        if (!row.pass) {
           throw new Error(`❌ ${entry.path} ${entry.op}: 期望=${JSON.stringify(expected)}，实际=${JSON.stringify(actual)}`);
         }
       }
@@ -143,20 +227,26 @@ async function executeAssert(
       if (!rec.requestBody) throw new Error(`❌ assert.request: ${assert.request.path} 请求体缺失`);
       let body: unknown;
       try { body = JSON.parse(rec.requestBody); } catch { throw new Error(`❌ assert.request: ${assert.request.path} 请求体非合法 JSON`); }
-      for (const entry of assert.body as ExpectEntry[]) {
+      for (const [index, entry] of (assert.body as ExpectEntry[]).entries()) {
+        const row = rows[index]!;
+        if (index > 0) beginResult(row);
+        row.evidence = observed.evidence;
         const sharedOp = mapOp(entry.op);
         const expected = 'value_ref' in entry ? vctx.resolve({ ref: entry.value_ref })
           : 'value_from_action' in entry ? vctx.resolve({ from_action: entry.value_from_action })
           : entry.value;
+        row.resolvedExpected = expected;
         const actual = jsonPath(body, entry.path);
-        actuals.push({ path: entry.path, actual: actual === undefined ? null : actual });
-        if (!compare(sharedOp, actual, expected)) {
+        recordActual(row, actual);
+        if (actual === undefined) row.evidence = { ...row.evidence as object, ...diagnoseMissingPath(body, entry.path) };
+        finishResult(row, compare(sharedOp, actual, expected));
+        if (!row.pass) {
           throw new Error(`❌ ${entry.path} ${entry.op}: 期望=${JSON.stringify(expected)}，实际=${JSON.stringify(actual)}`);
         }
       }
     }
     console.log(`✅ assert.request: ${assert.request.path}`);
-    return { kind: 'request', expect: assert.query ?? assert.body, actual: actuals, pass: true, executed: true };
+    return observed;
   }
 
   // assert.toast：通过标准 ARIA alert/status 读取可见通知（组件库无关）。
@@ -165,57 +255,74 @@ async function executeAssert(
   if ('toast' in assert) {
     guardNativeBudget(timeout, 'toast');
     const expected = assert.toast;
+    observed.resolvedExpected = expected;
     const notifications = page.getByRole('alert').or(page.getByRole('status'));
     await pollUntil(async (rem) => {
       const count = await notifications.count();
+      const actuals: string[] = [];
+      recordActual(observed, actuals);
       for (let i = 0; i < count; i++) {
         const text = await notifications.nth(i).innerText({ timeout: rem });
-        if (text.includes(expected)) return true;
+        actuals.push(text);
+        if (text.includes(expected)) {
+          recordActual(observed, text);
+          return true;
+        }
       }
       return false;
     }, timeout);
     console.log(`✅ assert.toast: ${expected}`);
-    return { kind: 'toast', expect: expected, actual: expected, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.text
   if ('text' in assert) {
     guardNativeBudget(timeout, 'text');
     const text = vctx.resolve(assert.text.value ?? { literal: assert.text.contains });
+    observed.resolvedExpected = text;
     if (!text.trim()) throw new Error('❌ assert.text: 期望值为空或纯空白');
     // within 存在：ctx 是 Locator，用 innerText()；不存在：读主文档/frame body.innerText
     const within = assert.text.within;
     const withinLoc = within ? resolveLocator(page, within, frames) : undefined;
     const bodyLoc = frames?.length ? (resolveFrame(page, frames) as import('@playwright/test').FrameLocator).locator('body') : page.locator('body');
+    observed.target = within ?? { css: 'body' };
     await pollUntil(async (rem) => {
       const content = withinLoc ? await withinLoc.innerText({ timeout: rem }) : await bodyLoc.innerText({ timeout: rem });
+      recordActual(observed, content);
       return content.includes(text);
     }, timeout);
     console.log(`✅ assert.text: ${text}`);
-    return { kind: 'text', expect: text, actual: text, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.visible
   if ('visible' in assert) {
     guardNativeBudget(timeout, 'visible');
     const loc = resolveLocator(page, assert.visible, frames);
+    observed.target = assert.visible;
+    observed.resolvedExpected = 'visible';
     await loc.waitFor({ state: 'visible', timeout });
+    recordActual(observed, 'visible');
     console.log(`✅ assert.visible`);
-    return { kind: 'visible', expect: assert.visible, actual: 'visible', pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.absent
   if ('absent' in assert) {
     guardNativeBudget(timeout, 'absent');
     const loc = resolveLocator(page, assert.absent, frames);
+    observed.target = assert.absent;
+    observed.resolvedExpected = 'hidden';
     await loc.waitFor({ state: 'hidden', timeout });
+    recordActual(observed, 'hidden');
     console.log(`✅ assert.absent`);
-    return { kind: 'absent', expect: assert.absent, actual: 'hidden', pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.table_row
   if ('table_row' in assert) {
     const contains = assert.table_row.contains;
+    observed.resolvedExpected = assert.table_row;
     const allRows = (frames?.length ? (resolveFrame(page, frames) as any) : page).locator('table tr, [role="row"]');
     const total = await allRows.count();
     let matched = 0;
@@ -223,21 +330,24 @@ async function executeAssert(
       const rowText = await allRows.nth(i).innerText().catch(() => '');
       if (rowText.includes(contains)) matched++;
     }
+    recordActual(observed, { matched, total });
     if (matched === 0) throw new Error(`❌ table_row: 未找到包含 "${contains}" 的行`);
     if (assert.table_row.count !== undefined && matched !== assert.table_row.count) {
       throw new Error(`❌ table_row: 期望 ${assert.table_row.count} 行，实际 ${matched} 行`);
     }
     console.log(`✅ assert.table_row: ${matched} 行匹配 "${contains}"`);
-    return { kind: 'table_row', expect: assert.table_row, actual: { matched }, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.field_value
   if ('field_value' in assert) {
     guardNativeBudget(timeout, 'field_value');
     const expected = vctx.resolve(assert.field_value.value);
+    observed.resolvedExpected = expected;
     const fv = assert.field_value;
     // Phase2：locator/read_mode 必需，删旧 getByLabel 兼容；label 仅作诊断
     const loc = resolveLocator(page, fv.locator, frames);
+    observed.target = fv.locator;
     let ev: ElementValue;
     try {
       ev = await loc.evaluate(readElementValue as (el: HTMLElement) => ElementValue);
@@ -247,6 +357,7 @@ async function executeAssert(
       }
       throw e;
     }
+    recordActual(observed, { value: ev.value, read_mode: ev.read_mode });
     if (ev.read_mode !== fv.read_mode) {
       // ARIA combobox: 录制时 DOM .value 为空串会标记 read_mode='value'，修复后取 ARIA 语义文本标记 read_mode='text'；
       // 两者都是同一选中值的不同读取通道，不阻塞回放
@@ -258,15 +369,17 @@ async function executeAssert(
     const actual = ev.value;
     if (actual !== expected) throw new Error(`❌ field_value: ${assert.field_value.label} 期望="${expected}"，实际="${actual}"`);
     console.log(`✅ assert.field_value: ${assert.field_value.label}="${expected}"`);
-    return { kind: 'field_value', expect: { label: fv.label, value: expected }, actual: { value: actual, read_mode: ev.read_mode }, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.url
   if ('url' in assert) {
     const url = page.url();
+    observed.resolvedExpected = assert.url.contains;
+    recordActual(observed, url);
     if (!url.includes(assert.url.contains)) throw new Error(`❌ assert.url: "${url}" 不包含 "${assert.url.contains}"`);
     console.log(`✅ assert.url: ${assert.url.contains}`);
-    return { kind: 'url', expect: assert.url, actual: url, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.data（P2）：回放时从当前 Page 重新读取（标准 CDP 协议 + 标量合同），
@@ -275,11 +388,14 @@ async function executeAssert(
   if ('data' in assert) {
     const source = assert.data.source;
     const expected = assert.data.equals;
+    observed.resolvedExpected = expected;
     // 指定 --frame 时必须用该 frame 的真实 channel(同源 root / OOPIF child);无 frame 才读主文档。
     const dataTarget = frames?.length
       ? await reqTracker.resolvePageDataTarget(page, await resolveFrameObject(page, frames, timeout))
       : undefined;
     const read = await readPageDataSource(page, source, dataTarget);
+    observed.evidence = { source, present: read.present };
+    if (!read.present) observed.actualStatus = 'missing';
     let actual: string | number | boolean | null;
     if ('local_storage' in source && source.path !== undefined) {
       if (!read.present) throw new Error(`❌ assert.data: localStorage key "${source.local_storage}" 缺失（缺失≠null）`);
@@ -290,6 +406,7 @@ async function executeAssert(
         throw new Error(`❌ assert.data: localStorage "${source.local_storage}" 不是合法 JSON`);
       }
       const hit = dataDotPath(parsed, source.path);
+      recordActual(observed, hit);
       if (hit === undefined) throw new Error(`❌ assert.data: path "${source.path}" 未命中（缺失≠null）`);
       if (hit !== null && (typeof hit === 'object' || typeof hit === 'function')) {
         throw new Error(`❌ assert.data: path "${source.path}" 命中非标量（只支持 string/number/boolean/null）`);
@@ -302,17 +419,20 @@ async function executeAssert(
       if (!read.present) throw new Error(`❌ assert.data: ${'local_storage' in source ? `localStorage key "${source.local_storage}"` : `global "${source.global}"`} 缺失（缺失≠null）`);
       actual = read.value as string | number | boolean | null;
     }
+    recordActual(observed, actual);
     if (actual !== expected) {
       // P4：诊断只带源与固定安全文案，不回显期望/实际值(防脱敏后敏感数据泄漏到 replay HTML)
       throw new Error(`❌ assert.data: ${JSON.stringify(source)} 期望值与实际值不一致`);
     }
     console.log(`✅ assert.data: ${JSON.stringify(source)} 与期望值一致`);
-    return { kind: 'data', expect: assert.data, actual: { value: actual }, pass: true, executed: true };
+    return { ...observed, pass: true };
   }
 
   // assert.style：计算样式（默认唯一目标；all 才逐个核对）
   if ('style' in assert) {
     const a = assert.style;
+    observed.target = a.locator;
+    observed.resolvedExpected = a.equals;
     const loc = resolveLocator(page, a.locator, frames);
     const count = await loc.count();
     const values: string[] = [];
@@ -323,17 +443,21 @@ async function executeAssert(
       }) as string);
     }
     const pass = count > 0 && (a.all === true ? values.every((v) => v === a.equals) : count === 1 && values[0] === a.equals);
-    return { kind: 'style', expect: a, actual: { matches: count, values }, pass, executed: true };
+    recordActual(observed, { matches: count, values });
+    return { ...observed, pass };
   }
 
   // assert.element：标准 DOM 属性或 count
   if ('element' in assert) {
     const a = assert.element;
+    observed.target = a.locator;
+    observed.resolvedExpected = a.value;
     const loc = resolveLocator(page, a.locator, frames);
     const count = await loc.count();
     if (a.property === 'count') {
       const pass = compare(mapOp(a.op), count, a.value);
-      return { kind: 'element', expect: a, actual: { matches: count }, pass, executed: true };
+      recordActual(observed, { matches: count });
+      return { ...observed, pass };
     }
     const values: Array<string | number | boolean> = [];
     for (let i = 0; i < count; i++) {
@@ -342,7 +466,8 @@ async function executeAssert(
     const pass = count > 0 && (a.all === true
       ? values.every((v) => compare(mapOp(a.op), v, a.value))
       : count === 1 && compare(mapOp(a.op), values[0], a.value));
-    return { kind: 'element', expect: a, actual: { matches: count, values }, pass, executed: true };
+    recordActual(observed, { matches: count, values });
+    return { ...observed, pass };
   }
 
   // assert.console：与 Source 同一 matchConsole 纯逻辑；范围 session/action 显式
@@ -358,12 +483,11 @@ async function executeAssert(
       ...(actionId ? { actionId } : {}),
       ...(frameId ? { frameId } : {}),
     });
+    observed.resolvedExpected = match.expected;
+    recordActual(observed, { expected: match.expected, actual: match.actual, counts: match.counts, incomplete: match.incomplete, complete: snap.complete, logs: match.logs });
     return {
-      kind: 'console',
-      expect: a,
-      actual: { expected: match.expected, actual: match.actual, counts: match.counts, incomplete: match.incomplete, complete: snap.complete, logs: match.logs },
+      ...observed,
       pass: match.pass && snap.complete,
-      executed: true,
     };
   }
 
@@ -376,6 +500,7 @@ async function executeCapture(
   vctx: ValueContext,
   reqTracker: RequestTracker,
   timeout: number,
+  observed: AssertionResult,
   frames?: import('./types.js').Frame[],
 ): Promise<void> {
   // capture.from_api（响应体完成驱动）
@@ -383,10 +508,13 @@ async function executeCapture(
     const rec = await reqTracker.waitForComplete(page, capture.from_api, timeout);
     const body = parseBodyOrThrow(rec.body, capture.from_api.path);
     const val = jsonPath(body, capture.path);
+    recordActual(observed, val);
+    observed.evidence = { from: capture.from_api, path: capture.path, as: capture.as, lineage: capture.lineage };
     if (val === undefined) throw new Error(`❌ capture.from_api: path "${capture.path}" 不存在`);
     if (val === null) throw new Error(`❌ capture.from_api: path "${capture.path}" 值为 null，不允许 capture`);
     const strVal = (typeof val === 'object') ? JSON.stringify(val) : String(val);
     vctx.set(capture.as, strVal);
+    observed.evidence = { ...observed.evidence as object, storedValue: strVal };
     // Phase2：捕值诊断只打印成功变量名，不打印值预览（URL/凭证来源值不落 stdout）
     console.log(`✅ capture.from_api: ${capture.as}`);
     return;
@@ -396,9 +524,12 @@ async function executeCapture(
   if ('from_element' in capture) {
     guardNativeBudget(timeout, 'capture.from_element');
     const loc = resolveLocator(page, capture.from_element, frames);
+    observed.target = capture.from_element;
     let text: string;
     try {
       const ev: ElementValue = await loc.evaluate(readElementValue as (el: HTMLElement) => ElementValue);
+      recordActual(observed, ev.value);
+      observed.evidence = { from: capture.from_element, as: capture.as, lineage: capture.lineage, read_mode: ev.read_mode };
       if (ev.read_mode !== capture.read_mode) {
         throw new Error(`❌ capture.from_element: ${capture.as} 读取通道不一致（录制 ${capture.read_mode}，回放 ${ev.read_mode}），拒绝换通道凑值`);
       }
@@ -513,4 +644,3 @@ class PredicateAwaitTimeout extends Error {
     this.name = 'PredicateAwaitTimeout';
   }
 }
-import { AUTH_DATA_NOT_REPLAYABLE, readElementValue, type ElementValue } from './shared/element-value.js';

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { readTrace, parseTrace } from '../ir/trace-reader.js';
 import { checkIr } from '../ir/check.js';
 import { judgeIr } from '../ir/judge.js';
@@ -59,7 +60,8 @@ export function loadStaticCase(irFile: string): StaticCaseSnapshot | LoadFailure
   if (!parsed.ok) return loadFailure('SCHEMA', JSON.stringify(parsed.error.issues));
   const checked = checkIr(parsed.ir);
   if (!checked.passed) return loadFailure('CHECK_FAILED', 'ir 静态 check 未通过', JSON.stringify(checked.failures));
-  return { ir: parsed.ir, raw };
+  const ir = isDeepStrictEqual(input, parsed.ir) ? input as IRv2 : parsed.ir;
+  return { ir, raw };
 }
 
 export function parseTestHeader(test: Buffer): TestHeader | null {

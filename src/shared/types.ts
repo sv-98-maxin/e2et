@@ -66,8 +66,9 @@ export interface CaptureFromApi { from_api: ApiRef; path: string; as: string; li
 export interface CaptureFromElement { from_element: Locator; as: string; lineage: Lineage; read_mode: 'value' | 'text'; }
 export type Capture = CaptureFromApi | CaptureFromElement;
 
-export interface CheckAssert { assert: Assert; frame?: Frame[]; }
-export interface CheckCapture { capture: Capture; frame?: Frame[]; }
+export interface ReportRef { group?: string; source_event_id?: string; check_id?: string; }
+export interface CheckAssert { assert: Assert; frame?: Frame[]; report_ref?: ReportRef; }
+export interface CheckCapture { capture: Capture; frame?: Frame[]; report_ref?: ReportRef; }
 export type Check = CheckAssert | CheckCapture;
 
 export type Action =
@@ -81,6 +82,7 @@ export interface Step {
   id: string;
   intent: string;
   action: Action;
+  report_ref?: ReportRef;
   frame?: Frame[];
   locator?: Locator;
   fallback?: Locator[];

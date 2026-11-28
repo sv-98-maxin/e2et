@@ -5,6 +5,7 @@ import type { OperationResult } from '../operation-result.js';
 import { isLoadFailure, loadFailure, readStoredCase, type CaseSnapshot } from './snapshot.js';
 import { verifyCase, type VerificationEnvironment, type VerifyData } from './replay.js';
 import type { ReplaySelection } from '../shared/replay-env.js';
+import type { AcceptanceInput } from '../report/acceptance.js';
 
 export function caseLibraryRoot(homeDir: string): string {
   return path.join(homeDir, '.e2et', 'library');
@@ -110,7 +111,7 @@ export interface LandData {
 export async function landCase(
   environment: VerificationEnvironment & { homeDir: string },
   snapshot: CaseSnapshot,
-  options: { force: boolean; output?: string; replay: ReplaySelection },
+  options: { force: boolean; output?: string; replay: ReplaySelection; acceptance?: AcceptanceInput },
 ): Promise<OperationResult<LandData>> {
   const library = caseLibraryRoot(environment.homeDir);
   const targetRoot = path.join(library, snapshot.ir.name);
@@ -145,7 +146,7 @@ export async function landCase(
   }
 
   try {
-    const verification = await verifyCase(environment, snapshot, { skip: false, output: options.output, replay: options.replay });
+    const verification = await verifyCase(environment, snapshot, { skip: false, output: options.output, replay: options.replay, acceptance: options.acceptance });
     if (!verification.ok) return verification;
     const raced = inspectExistingCaseDir(targetRoot);
     if (isLoadFailure(raced)) return validation(raced.load_error.code, raced.load_error.message, raced.load_error.hint);

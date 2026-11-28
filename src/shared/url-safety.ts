@@ -17,7 +17,7 @@ function redactPlainText(value: string): string {
   return value
     .replace(/(bearer\s+)[^\s,;]+/gi, '$1' + REDACTED)
     .replace(new RegExp('([?&]' + key + '=)[^&#\\s]*', 'gi'), '$1' + REDACTED)
-    .replace(new RegExp('(\\b' + key + '\\b\\s*[\\"\\\']?\\s*[:=]\\s*)(?:\\"[^\\"]*\\"|\\\'[^\\\']*\\\'|[^\\r\\n&,;}\\]]+)', 'gi'), '$1' + REDACTED);
+    .replace(new RegExp('(\\b' + key + '\\b\\s*[\\"\\\']?\\s*[:=]\\s*)(?:\\"[^\\"]*\\"|\\\'[^\\\']*\\\'|(?:\\[REDACTED\\]|[^\\r\\n&,;}\\]])+)', 'gi'), '$1' + REDACTED);
 }
 
 export function redactText(value: string): string {

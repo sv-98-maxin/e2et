@@ -19,7 +19,7 @@ metadata:
 | 安装入口、setup、session、浏览器和登录态 | [setup-auth.md](references/setup-auth.md) |
 | 定位、页面动作、等待、表单和动态值 | [operations.md](references/operations.md) |
 | 文本、样式、元素、console、iframe 等断言与诊断 | [ui-check.md](references/ui-check.md) |
-| group/plan、结果判读、原生报告与汇总 | [acceptance.md](references/acceptance.md) |
+| 验收说明、group/plan、最终事实、原生报告与汇总 | [acceptance.md](references/acceptance.md) |
 | 用例发现、Source → IR、保存、回放和重编译 | [cases.md](references/cases.md) |
 | 调用错误、前置失败、超时与最小诊断 | [tool-issues.md](references/tool-issues.md) |
 
@@ -36,13 +36,13 @@ metadata:
 2. 网页动作和测试产物走 e2et。缺能力时给原始错误和未执行项，不用其他浏览器工具、近似断言或手拼报告冒充结果。只询问缺失的目标、预期、身份或授权；sid、定位器、参数和产物路径从 CLI/页面自行取得。
 3. 身份与环境使用本次显式输入，不在失败后偷偷换个人身份。保存、提交、删除、通知等操作及其次数须在授权内；verify、land 和 case run 会实际执行页面步骤，保存用例不额外授予写权限。
 4. 参数报错可按合同修正；网页动作结果未知时先读 state 和现有证据，不盲目重试有副作用的动作。已成功的写操作不为修断言、补截图或刷 PASS 再做一次。
-5. `ok=true` 与退出 0 只表示命令执行成功。断言看 `data.pass`，报告和回放按各自结果字段判读；只有观察或截图时说明“已观察，未验证”，不宣称业务通过。
+5. `ok=true` 与退出 0 只表示命令执行成功。断言看 `data.pass`；Source/merge 仍读返回 `data.json` 的原 `report.json`，回放读 `report.facts_json` 的最终 ReportData 并对照 PW 原始 `report.json`，`report.html` 为新自包含 HTML。land 的 report 在 `data.verification.report`，失败路径从实际 `error.evidence` 读取；中间附件不覆盖最终 FAIL/BLOCKED。只有观察或截图时说明“已观察，未验证”，不宣称业务通过。
 6. trace、IR、checks、生成的测试和 fixtures 不手改来绕过校验。场景步骤、定位、输入或断言变化时重新录制；需要每次新值时使用 CLI 模板和引用，不能把录制旧值伪装成动态输入。
 
 ## 最小页面测试流程
 
-1. 查所需 commands，按 setup-auth 准备浏览器和身份；从返回读取 workspace、session_id。
+1. 查所需 commands，按 setup-auth 准备浏览器和身份；从返回读取 workspace、session_id。需要验收说明时，执行前按 acceptance 手册准备独立预期，给本次入口传已核支持的 `--acceptance '<file>'`，由 CLI 校验冻结；无输入不造说明，仅汇总或收尾不补快照。
 2. 打开目标并取 page state；按当前 DOM/ARIA 信息定位和操作，必要时附加显式等待。
-3. 对用户的预期执行正式 assert；需要可核验报告时，同一 group 在所有动作与断言后截完成态图。plan 只列本次检查项，不凭空补业务规则。
+3. 对用户的预期执行正式 assert；绑定验收项时先核 `--check-id` 能力，使用冻结说明中的检查 ID 与对应 group。需要可核验报告时，同一 group 在所有动作与断言后截完成态图。plan 只列本次检查项，不凭空补业务规则。
 4. 无论通过、失败还是阻断，结束本轮已启动的会话并生成原生报告。返回实际 HTML 路径、结果和未验证项；收尾失败则保留原始错误，不声称已有完整报告。
 5. 只有用户需要复用场景时，再按 cases 手册编译、保存或回放。缺少前置且未启动会话时直接说明阻断，不伪造会话或报告。

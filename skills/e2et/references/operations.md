@@ -93,6 +93,6 @@ e2et capture api -s '<sid>' '<req>' '<json-path>' --as newId --group '<group>'
 
 ## 操作边界
 
-- page execute 是 JavaScript 诊断能力，不是可映射 Source 动作；需诊断时用独立会话，不以改 DOM/状态冒充测试路径或删 trace 绕过 UNMAPPED_ACTIONS。
+- page execute 是 JavaScript 诊断能力；本次需要归组时先核对应 commands 已支持 `--group`，报告保留安全代码、返回与错误。脚本结果不冒充正式 assert 或鼠标/键盘路径，仍不可映射到 IR，不删 trace 绕过 UNMAPPED_ACTIONS；已有会话只收尾时不补执行或重开会话。
 - mock 会改变请求来源，须标明模拟；用过 mock add 的会话不能落库。
 - 动作异常按 [tool-issues.md](tool-issues.md) 保留现场；有副作用的动作不因超时或缺响应 body 自动重发。

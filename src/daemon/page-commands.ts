@@ -27,6 +27,7 @@ import type { PageContext } from './page-context.js';
 import type { PageObservers } from './page-observers.js';
 import type { NetworkTrace } from './network-trace.js';
 import type { ActionRunner } from './action-runner.js';
+import type { FlowRecorder } from './flow-recorder.js';
 import { NAV_TIMEOUT_MS, SETTLE_MS, waitForLoad } from './action-waits.js';
 import { requestContext } from '../request-context.js';
 
@@ -41,6 +42,7 @@ export interface PageCommandsDeps {
   networkTrace: () => NetworkTrace | null;
   lifecycleSnapshot: () => Readonly<LifecycleSnapshot>;
   runner: ActionRunner;
+  flow: FlowRecorder;
   trace: (ev: Record<string, unknown>) => void;
 }
 
@@ -167,6 +169,7 @@ export class PageCommands {
   private async open(req: DaemonRequest, onWaitStarted: (deadlineMs: number) => void): Promise<DaemonResponse> {
     if (!String(req.params?.url ?? '')) return this.fail(req, 'BAD_REQUEST', '缺 url');
     await this.attachConsole();
+    await this.deps.flow.start();
     return this.deps.runner.run(req, 'open', onWaitStarted, async ({ cdp }) => {
       const actualUrl = String(req.params?.url ?? '');
       await navigate(cdp, actualUrl);
@@ -278,7 +281,8 @@ export class PageCommands {
     const intent = String(req.params?.intent ?? '');
     if (!intent) return this.fail(req, 'BAD_REQUEST', '缺 intent');
     const awaitPromise = req.params?.await_promise === true;
-    const action = nt.beginAction('execute', intent, { expression, await_promise: awaitPromise });
+    const group = typeof req.params?.group === 'string' && req.params.group ? req.params.group : undefined;
+    const action = nt.beginAction('execute', intent, { expression, await_promise: awaitPromise }, { ...(group ? { group } : {}) });
     if (!action) return this.fail(req, 'BUSY', '已有 action 正在执行');
     try {
       const result = await cdp.send<{
@@ -317,7 +321,8 @@ export class PageCommands {
       const truncated = truncateResult(remoteObj.value);
       const shot = await this.saveScreenshot(cdp);
       requestContext.getStore()?.signal.throwIfAborted();
-      const trace = nt.finishAction(action, true, { execute_result: truncated, ...(shot.path ? { screenshot_path: shot.path } : {}), ...(shot.error ? { screenshot_error: shot.error } : {}) });
+      const trace = nt.finishAction(action, true, { execute_result: truncated, screenshot_started_at: shot.startedAt, screenshot_ended_at: shot.endedAt,
+        ...(shot.path ? { screenshot_path: shot.path } : {}), ...(shot.error ? { screenshot_error: shot.error } : {}) });
       return this.ok(req, { ...trace, result: truncated, ...(shot.path ? { screenshot_path: shot.path } : {}), ...(shot.error ? { screenshot_error: shot.error } : {}) });
     } catch (e) {
       const signal = requestContext.getStore()?.signal;
@@ -340,13 +345,21 @@ export class PageCommands {
     if (!intent) return this.fail(req, 'BAD_REQUEST', '缺 intent');
     const fullPage = Boolean(req.params?.full_page);
     const group = req.params?.group !== undefined ? String(req.params.group) : undefined;
-    const data = await captureScreenshot(cdp, fullPage);
-    const buf = Buffer.from(data, 'base64');
-    const file = this.writeScreenshot(buf);
-    if (group) {
-      this.deps.trace({ t: 'screenshot', after: this.nt?.getLastFinishedActionId() ?? '', group, path: file, full_page: fullPage });
+    const id = `screenshot_${crypto.randomUUID()}`;
+    const startedAt = Date.now();
+    const after = this.nt?.getLastFinishedActionId() ?? '';
+    try {
+      const data = await captureScreenshot(cdp, fullPage);
+      const buf = Buffer.from(data, 'base64');
+      const file = this.writeScreenshot(buf);
+      const endedAt = Date.now();
+      this.deps.trace({ t: 'screenshot', id, ts: startedAt, ts_end: endedAt, after, group, intent, path: file, full_page: fullPage, status: 'pass' });
+      return this.ok(req, { path: file, full_page: fullPage, bytes: buf.length });
+    } catch (error) {
+      const message = redactText(error instanceof Error ? error.message : String(error));
+      this.deps.trace({ t: 'screenshot', id, ts: startedAt, ts_end: Date.now(), after, group, intent, status: 'error', error: message });
+      return this.fail(req, 'SCREENSHOT_ERROR', message);
     }
-    return this.ok(req, { path: file, full_page: fullPage, bytes: buf.length });
   }
 
   private writeScreenshot(buf: Buffer): string {
@@ -359,12 +372,13 @@ export class PageCommands {
     return file;
   }
 
-  private async saveScreenshot(cdp: import('../browser/daemon-client.js').CdpSession): Promise<{ path?: string; error?: string }> {
+  private async saveScreenshot(cdp: import('../browser/daemon-client.js').CdpSession): Promise<{ path?: string; error?: string; startedAt: number; endedAt: number }> {
+    const startedAt = Date.now();
     try {
       const data = await captureScreenshot(cdp, false);
-      return { path: this.writeScreenshot(Buffer.from(data, 'base64')) };
+      return { path: this.writeScreenshot(Buffer.from(data, 'base64')), startedAt, endedAt: Date.now() };
     } catch (e) {
-      return { error: redactText((e as Error).message) };
+      return { error: redactText((e as Error).message), startedAt, endedAt: Date.now() };
     }
   }
 

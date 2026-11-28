@@ -259,6 +259,7 @@ export class NetworkTrace {
   private cancelled = false;
   /** 最近一个 finishAction 的 action.id,assert/capture 挂 after 用。无 action 时 null。 */
   private lastFinishedActionId: string | null = null;
+  private lastFinishedActionGroup: string | undefined;
   /** 请求 id → {req_body_ref, resp_body_ref, creates?, failed?},assert/capture 读 body 用。 */
   private bodyRefs = new Map<string, { req_body_ref?: string; resp_body_ref?: string; req_body_omitted?: string; resp_body_omitted?: string; creates?: string; failed?: string | null; status?: number; req_body_redacted_paths?: string[][]; resp_body_redacted_paths?: string[][] }>();
 
@@ -493,7 +494,7 @@ export class NetworkTrace {
   finishAction(
     action: TraceAction,
     ok: boolean,
-    extra?: { settled_by?: SettledBy[]; target?: unknown; creates?: string; execute_result?: unknown; screenshot_path?: string; screenshot_error?: string; resolved_tab?: { target_id: string; url: string; resolved_index: number; from_target_id?: string }; resolved_value?: string; output_value?: string; saved_value?: string; source_action?: string; error?: { code: string; message: string; hint?: string } },
+    extra?: { settled_by?: SettledBy[]; target?: unknown; creates?: string; execute_result?: unknown; screenshot_path?: string; screenshot_error?: string; screenshot_started_at?: number; screenshot_ended_at?: number; resolved_tab?: { target_id: string; url: string; resolved_index: number; from_target_id?: string }; resolved_value?: string; output_value?: string; saved_value?: string; source_action?: string; error?: { code: string; message: string; hint?: string } },
   ): { action_id: string; requests: RequestSummary[]; navigation: string | null; settled_by: SettledBy[] } {
     const signal = requestContext.getStore()?.signal;
     if (signal?.aborted) {
@@ -503,6 +504,7 @@ export class NetworkTrace {
     }
     if (this.activeAction === action) this.activeAction = null;
     this.lastFinishedActionId = action.id;
+    this.lastFinishedActionGroup = action.group;
     appendTraceEvent(this.sessionId, {
       t: 'action',
       id: action.id,
@@ -527,6 +529,8 @@ export class NetworkTrace {
       ...(action.group ? { group: action.group } : {}),
       ...(extra?.screenshot_path ? { screenshot_path: extra.screenshot_path } : {}),
       ...(extra?.screenshot_error ? { screenshot_error: extra.screenshot_error } : {}),
+      ...(extra?.screenshot_started_at !== undefined ? { screenshot_started_at: extra.screenshot_started_at } : {}),
+      ...(extra?.screenshot_ended_at !== undefined ? { screenshot_ended_at: extra.screenshot_ended_at } : {}),
       ...(extra?.resolved_value !== undefined ? { resolved_value: extra.resolved_value } : {}),
       ...(extra?.output_value !== undefined ? { output_value: extra.output_value } : {}),
       ...(extra?.saved_value !== undefined ? { saved_value: extra.saved_value } : {}),
@@ -1150,5 +1154,9 @@ export class NetworkTrace {
   /** 最近一个 finishAction 的 action id;无 action 返回 null。 */
   getLastFinishedActionId(): string | null {
     return this.lastFinishedActionId;
+  }
+
+  getLastFinishedActionGroup(): string | undefined {
+    return this.lastFinishedActionGroup;
   }
 }

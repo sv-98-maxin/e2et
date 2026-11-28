@@ -162,7 +162,10 @@ describe('build:data 断言提炼与失败观察拒绝', () => {
     if (!result.ok) return;
     const checks = result.ir.steps[0].checks!;
     expect(checks).toHaveLength(1);
-    expect(checks[0]).toEqual({ assert: { data: { source: { local_storage: 'cfg', path: 'record.mode' }, equals: 'fast' } } });
+    expect(checks[0]).toEqual({
+      assert: { data: { source: { local_storage: 'cfg', path: 'record.mode' }, equals: 'fast' } },
+      report_ref: { group: '校验证' },
+    });
   });
 
   it('trace 含失败 observation → 拒绝(裁剪 reachable 前)', async () => {

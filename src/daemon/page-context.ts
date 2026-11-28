@@ -29,6 +29,7 @@ export interface PageContextDeps {
   observers: () => PageObservers | null;
   lifecycleSnapshot: () => Readonly<LifecycleSnapshot>;
   onAbort: () => void;
+  onActivePageChanged?: () => void;
   trace: (event: Record<string, unknown>) => void;
 }
 
@@ -184,6 +185,7 @@ export class PageContext {
     this.bindChangeCount(entry.pageWs);
     this.lastDomChangeCountValue = 0;
     this.clearRefs();
+    this.deps.onActivePageChanged?.();
     return { targetId: entry.targetId, url: this.targetUrl(targetId) };
   }
 

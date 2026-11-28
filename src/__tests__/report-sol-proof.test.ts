@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as vm from 'node:vm';
 import { appendTraceEvent, ensurePrivateDir, storeTraceBody } from '../daemon/trace.js';
 import { dispatch } from '../cli/router.js';
 import { renderReportHtml, type ReportData } from '../shared/report-render.js';
@@ -9,6 +10,93 @@ import { buildReport, type StepOutcome } from '../../runtime_assets/runtime/repo
 import type { IRv2, Step } from '../../runtime_assets/runtime/types.js';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+
+/** 新版报告是内联脚本渲染的，断言必须跑真实脚本后读 DOM，而不是在 HTML 源码里找旧 class。 */
+class FakeClassList {
+  constructor(private readonly element: FakeElement) {}
+  private names(): string[] { return this.element.className.split(/\s+/).filter(Boolean); }
+  contains(name: string): boolean { return this.names().includes(name); }
+  add(name: string): void { if (!this.contains(name)) this.element.className = [...this.names(), name].join(' '); }
+  remove(name: string): void { this.element.className = this.names().filter(item => item !== name).join(' '); }
+  toggle(name: string, force?: boolean): boolean {
+    const on = force ?? !this.contains(name);
+    if (on) this.add(name); else this.remove(name);
+    return on;
+  }
+}
+
+class FakeElement {
+  children: FakeElement[] = [];
+  dataset: Record<string, string> = {};
+  className = '';
+  hidden = false;
+  disabled = false;
+  type = '';
+  src = '';
+  alt = '';
+  open = false;
+  value = '';
+  classList = new FakeClassList(this);
+  private text = '';
+  private attributes: Record<string, string> = {};
+  constructor(readonly tagName: string) {}
+  get textContent(): string { return this.text + this.children.map(child => child.textContent).join(''); }
+  set textContent(value: string) { this.text = String(value); this.children = []; }
+  append(...children: FakeElement[]): void { this.children.push(...children); }
+  replaceChildren(...children: FakeElement[]): void { this.children = children; this.text = ''; }
+  addEventListener(): void {}
+  setAttribute(name: string, value: string): void { this.attributes[name] = String(value); }
+  getAttribute(name: string): string | null { return this.attributes[name] ?? null; }
+  removeAttribute(name: string): void { delete this.attributes[name]; }
+  scrollIntoView(): void {}
+  focus(): void {}
+  showModal(): void { this.open = true; }
+  close(): void { this.open = false; }
+  closest(): FakeElement | null { return null; }
+  querySelectorAll(selector: string): FakeElement[] {
+    const found: FakeElement[] = [];
+    const visit = (element: FakeElement): void => {
+      for (const child of element.children) {
+        const matched = selector.startsWith('.') ? child.classList.contains(selector.slice(1))
+          : selector === '[aria-current=true]' ? child.getAttribute('aria-current') === 'true'
+            : child.tagName === selector;
+        if (matched) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+  querySelector(selector: string): FakeElement | null { return this.querySelectorAll(selector)[0] ?? null; }
+}
+
+function renderDom(data: ReportData): { html: string; payload: any; el: (id: string) => FakeElement } {
+  const html = renderReportHtml(data);
+  const script = [...html.matchAll(/<script(?:[^>]*)>([\s\S]*?)<\/script>/g)][1]![1]!;
+  const elements = new Map<string, FakeElement>();
+  const element = (id: string): FakeElement => {
+    if (!elements.has(id)) elements.set(id, new FakeElement('div'));
+    return elements.get(id)!;
+  };
+  const document = {
+    body: new FakeElement('body'), documentElement: new FakeElement('html'),
+    createElement: (tag: string) => new FakeElement(tag), getElementById: element,
+    addEventListener: () => {},
+  };
+  const payload = html.match(/<script id="report-data" type="application\/json">([\s\S]*?)<\/script>/)![1]!;
+  element('report-data').textContent = payload;
+  const window = {
+    matchMedia: () => ({ matches: false, addEventListener: () => {} }),
+    getSelection: () => ({ removeAllRanges: () => {}, addRange: () => {} }),
+  };
+  const sandbox = {
+    document, window, navigator: { clipboard: { writeText: async () => {} } },
+    JSON, Set, Map, Number, Object, Array, Date, Math, String, RegExp, Boolean, console,
+    setTimeout: () => 0, clearTimeout: () => {},
+  };
+  vm.runInNewContext(script, { ...sandbox, globalThis: sandbox });
+  return { html, payload: JSON.parse(payload), el: element };
+}
 
 /**
  * 反例取自 review-r2-sol-proof-wf2Yr7：真实生产结构（NetworkTrace.beginAction/finishAction
@@ -150,7 +238,11 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     // B 有 assert 通过且完成态截图 → 不该报「未执行」
     expect(json.conclusion).toBe('PASS');
     // B 不被报「未执行」
-    expect(html).not.toContain('未执行');
+    const directory = renderDom(json).el('scenarios').querySelectorAll('.scenario');
+    const entry = (name: string) => directory.find(item => item.textContent.startsWith(name) || item.textContent.includes(name))!;
+    expect(entry('A').textContent).toContain('通过');
+    expect(entry('B').textContent).toContain('通过');
+    expect(entry('B').textContent).not.toContain('未执行');
   });
 
   // finding 4: 一个无 group execute 后 A、B 两个独立断言组
@@ -164,7 +256,13 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const { json, html } = await report(id, ['--plan', plan]);
     // B 有 assert 通过且 A 也通过，但缺断言后完成态截图 → BLOCKED（finding 8），不被报「未执行」
     expect(json.conclusion).toBe('BLOCKED');
-    expect(html).not.toContain('未执行');
+    const directory = renderDom(json).el('scenarios').querySelectorAll('.scenario');
+    for (const name of ['A', 'B']) {
+      const entry = directory.find(item => item.textContent.includes(name))!;
+      // 两组都缺完成态截图 → 阻断，但都保留了显式断言事实
+      expect(entry.textContent).toContain('阻断');
+      expect(entry.textContent).not.toContain('未执行');
+    }
   });
 
   // finding 5: capture.api 真实 from {path,nav,call_index,req_id}，report 消费 req_id
@@ -244,12 +342,15 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.list', op: 'exists', value: null }, actual: bigArray, evidence: [] });
     const spDone = shot(id, 'done');
     appendTraceEvent(id, { t: 'screenshot', after: 'a1', group: 'A', path: spDone });
-    const { html } = await report(id);
-    // 断言表的实际值单元格截断，不把 300 个 catProperty 全 dump 到主体
-    const actualMatch = html.match(/<td class="assert-actual">([^<]*)<\/td>/);
-    expect(actualMatch).toBeTruthy();
-    expect(actualMatch![1]).toContain('…');
-    expect(actualMatch![1]).not.toContain('catProperty250');
+    const { json } = await report(id);
+    // 大数组首屏只给摘要，完整值收进折叠 details，不倒进对照行
+    const card = renderDom(json).el('checks').querySelectorAll('.check')
+      .find(item => item.textContent.includes('data.list'))!;
+    expect(card).toBeTruthy();
+    const values = card.querySelectorAll('details');
+    expect(values.length).toBeGreaterThan(0);
+    expect(values.map(item => item.children[0]?.textContent ?? '').join('')).not.toContain('catProperty');
+    expect(values.some(item => item.textContent.includes('catProperty'))).toBe(true);
   });
 
   // finding 7: 同组两个显式接口都渲染
@@ -301,8 +402,8 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     expect(json.conclusion).toBe('BLOCKED');
   });
 
-  // finding 12: 附录诊断失败不改写业务结论
-  it('诊断 assert 失败进附录，不改写业务结论', async () => {
+  // 业务步骤独立保留；诊断 assert 失败仍收紧 Source 会话终态。
+  it('诊断 assert 失败进附录，业务步骤通过但会话 FAIL', async () => {
     const id = sid();
     const sp = shot(id, 'a1');
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
@@ -314,8 +415,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const plan = path.join(home, 'plan.json');
     fs.writeFileSync(plan, JSON.stringify(['A']));
     const { json, html } = await report(id, ['--plan', plan]);
-    // 业务 A 完整通过 → PASS，诊断失败进附录不升级为 FAIL（finding 12）
-    expect(json.conclusion).toBe('PASS');
+    expect(json.cases[0].steps[0].status).toBe('pass');
+    expect(json.cases[0].appendix[0].status).toBe('fail');
+    expect(json.cases[0].run.status).toBe('FAIL');
+    expect(json.conclusion).toBe('FAIL');
   });
 
   // finding 14: backendInfo 从失败 api assert 自动组装
@@ -328,20 +431,22 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const { json, html } = await report(id);
     expect(json.conclusion).toBe('FAIL');
     expect(html).not.toContain('给后端的排查信息');
-    expect(html).toContain('后端失败诊断');
-    expect(html).toContain('trace-r1');
-    expect(html).toContain('https://example.test/fail.json');
-    const diagnostics = html.match(/<details class="tech-evidence backend-diagnostics">[\s\S]*?<\/details>/);
+    const dom = renderDom(json);
+    const diagnostics = dom.el('context').querySelectorAll('.backend-diagnostics')[0]!;
     expect(diagnostics).toBeTruthy();
-    expect(diagnostics![0]).not.toMatch(new RegExp(`^<details[^>]*\\sopen`));
-    const stepHtml = html.slice(html.indexOf('<div class="step fail">'), html.indexOf('backend-diagnostics'));
-    expect(stepHtml).toContain('data.tip');
-    expect(stepHtml).toContain('class="code-tag code-ok">200</span>');
-    expect(stepHtml).toContain('actual');
-    expect(stepHtml).toContain('trace-r1');
-    expect(stepHtml).toContain('https://example.test/fail.json');
-    expect(stepHtml).not.toMatch(/<details class="full-response"[^>]*\sopen/);
-    expect(stepHtml).not.toMatch(/<details class="headers"[^>]*\sopen/);
+    expect(diagnostics.open).toBe(false);
+    expect(diagnostics.textContent).toContain('后端失败诊断');
+    expect(diagnostics.textContent).toContain('trace-r1');
+    expect(diagnostics.textContent).toContain('https://example.test/fail.json');
+    const card = dom.el('checks').querySelectorAll('.check')[0]!;
+    expect(card.textContent).toContain('data.tip');
+    expect(card.textContent).toContain('actual');
+    expect(card.textContent).toContain('traceId · trace-r1');
+    const tech = card.querySelectorAll('.tech-evidence')[0]!;
+    expect(tech.open).toBe(false);
+    expect(tech.textContent).toContain('https://example.test/fail.json');
+    expect(tech.textContent).toContain('200');
+    expect(tech.textContent).toContain('"tip":"actual"');
   });
 
   // finding 16: 统计不混单位
@@ -390,17 +495,20 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       missing: ['验证审批详情'],
       unplanned: ['验证计划外补充场景'],
     });
-    expect(html).toContain('验证范围与边界');
-    expect(html).toContain('计划范围');
-    expect(html).toContain('验证审批详情');
-    expect(html).toContain('验证计划外补充场景');
-    expect(html).toContain('覆盖计划缺失 1 项');
-    expect(html).not.toContain('sprint-42548-618');
-    expect(html).not.toContain('sprint-missing-999');
+    const dom = renderDom(json);
+    const boundary = dom.el('context').querySelectorAll('.coverage-boundary')[0]!;
+    expect(boundary.textContent).toContain('验证范围与边界');
+    expect(boundary.textContent).toContain('计划范围');
+    expect(boundary.textContent).toContain('验证审批详情');
+    expect(boundary.textContent).toContain('验证计划外补充场景');
+    expect(boundary.textContent).toContain('覆盖计划缺失 1 项');
+    expect(dom.el('scenarios').textContent).not.toContain('sprint-42548-618');
+    expect(dom.el('scenarios').textContent).not.toContain('sprint-missing-999');
+    expect(dom.el('scenarios').textContent).toContain('验证净含量文本输入（500g）');
   });
 
   it('首屏只对 Mock、blocked、coverage missing 显示独立风险；无 plan 由覆盖区表达', () => {
-    const html = renderReportHtml(renderData({
+    const dom = renderDom(renderData({
       result: 'BLOCKED',
       mocked: true,
       coverage: { plan: ['验证审批详情'], executed: ['验证净含量'], missing: ['验证审批详情'], unplanned: ['验证净含量'] },
@@ -418,20 +526,19 @@ describe('report 真实判定回归（review-r2 反例）', () => {
         }],
       }],
     }));
-    expect(html).toContain('Mock 结果不可作为真实后端落库依据');
-    expect(html).toContain('存在 1 个阻塞业务步骤：验证净含量');
-    expect(html).toContain('覆盖计划缺失 1 项：验证审批详情');
-    expect(html).toContain('<ul class="risk-list"');
-    expect(html).not.toContain('未提供覆盖计划，不能证明完整需求覆盖');
+    expect(dom.el('boundary').textContent).toContain('Mock 已开启 · 不能作为真实后端落库依据');
+    expect(dom.el('context').textContent).toContain('场景阻断 · 截图缺失');
+    const boundary = dom.el('context').querySelectorAll('.coverage-boundary')[0]!;
+    expect(boundary.textContent).toContain('覆盖计划缺失 1 项');
+    expect(boundary.textContent).toContain('验证审批详情');
 
-    const noPlan = renderReportHtml(renderData());
-    expect(noPlan).toContain('未提供覆盖计划，仅代表已执行断言，不能证明完整需求覆盖');
-    expect(noPlan).toContain('未提供覆盖计划</b><span>仅代表已执行断言，不能证明完整需求覆盖。');
-    expect(noPlan).not.toContain('<ul class="risk-list"');
+    const noPlan = renderDom(renderData());
+    expect(noPlan.el('boundary').textContent).toContain('未提供独立验收说明，不能证明完整需求覆盖');
+    expect(noPlan.el('context').querySelectorAll('.coverage-boundary')).toHaveLength(0);
   });
 
-  it('PASS 只直显断言和截图，接口与原始证据进入默认关闭的技术证据', () => {
-    const html = renderReportHtml(renderData({
+  it('PASS 只直显断言和截图，接口证据默认关闭', () => {
+    const dom = renderDom(renderData({
       cases: [{
         id: 'TC-01',
         name: '净含量验证',
@@ -443,6 +550,8 @@ describe('report 真实判定回归（review-r2 反例）', () => {
           observation: '接口字段 pass',
           duration: '10ms',
           assertions: [{ kind: 'api', expect: { path: 'data.tip', op: '==', value: '净含量' }, actual: '净含量', pass: true, evidence: [{ req_id: 'r1' }] }],
+          actionIds: ['a1'],
+          eventIds: ['a1', 'a1:assert'],
           apis: [{
             reqId: 'r1',
             method: 'POST',
@@ -459,51 +568,40 @@ describe('report 真实判定回归（review-r2 反例）', () => {
           evidence: 'NETWORK_RAW_SENTINEL',
           executeResult: { json: 'EXECUTE_RESULT_SENTINEL' },
         }],
-        backendInfo: {
-          api: 'https://example.test/backend-info',
-          traceId: 'backend-trace',
-          time: '2026-11-08T00:00:00.000Z',
-          failure: 'BACKEND_FAILURE_SENTINEL',
-          response: '{"backend":"response"}',
-          params: '{"backend":"params"}',
-        },
+        events: [
+          {
+            id: 'a1', sequence: 1, type: 'action', kind: 'click', status: 'pass', executed: true,
+            actionId: 'a1', intent: '验证净含量',
+          },
+          {
+            id: 'a1:assert', sequence: 2, type: 'assert', kind: 'api', status: 'pass', executed: true,
+            actionId: 'a1', expect: { path: 'data.tip', op: '==', value: '净含量' },
+            resolvedExpected: '净含量', actual: '净含量', actualStatus: 'present', evidence: [{ req_id: 'r1' }],
+          },
+        ],
+        backendInfo: undefined,
       }],
       coverage: { plan: ['验证净含量'], executed: ['验证净含量'], missing: [], unplanned: [] },
     }));
-    const stepStart = html.indexOf('<div class="step pass">');
-    const techStart = html.indexOf('<details class="tech-evidence">', stepStart);
-    expect(stepStart).toBeGreaterThan(-1);
-    expect(techStart).toBeGreaterThan(stepStart);
-    const firstScreen = html.slice(stepStart, techStart);
-    expect(firstScreen).toContain('class="assert-table"');
-    expect(firstScreen).toContain('class="shot"');
-    expect(firstScreen).not.toContain('class="method"');
-    expect(firstScreen).not.toContain('/api/item.json');
-    expect(firstScreen).not.toContain('HTTP 200');
-    expect(html).not.toContain('class="risk-list"');
-    const tech = html.slice(techStart);
-    expect(tech).not.toMatch(new RegExp(`^<details[^>]*\\sopen`));
-    expect(tech).toContain('技术证据 · 1 个接口');
-    expect(tech).toContain('POST');
-    expect(tech).toContain('/api/item.json');
-    expect(tech).toContain('class="json-response-tree"');
-    expect(tech).toContain('{…} · 2项');
-    expect(tech).toContain('<details class="response-source"><summary>响应原文</summary>');
-    expect(tech).toContain('<details class="headers"><summary>响应头');
-    expect(tech).toContain('<details class="full-response"><summary>完整 URL</summary>');
-    expect(tech).toContain('观察证据（原始）');
-    expect(tech).toContain('NETWORK_RAW_SENTINEL');
-    expect(tech).not.toContain('完整验证事实');
-    expect(html).not.toContain('EXECUTE_RESULT_SENTINEL');
-    expect(html).not.toContain('后端失败诊断');
-    expect(html).not.toContain('BACKEND_FAILURE_SENTINEL');
-    expect(html).toContain('.step.pass .shot { width: 100%; height: 480px; max-height: 480px; object-fit: cover; object-position: top; }');
-    expect(html).not.toContain('.step.fail .shot {');
-    expect(html).not.toContain('.step.blocked .shot {');
+    const checks = dom.el('checks');
+    expect(checks.textContent).toContain('净含量');
+    // 首屏对照（details 外的 facts）不直显接口，接口收进默认关闭的技术证据
+    expect(checks.querySelectorAll('.facts')[0]!.textContent).not.toContain('/api/item.json');
+    expect(checks.textContent).not.toContain('EXECUTE_RESULT_SENTINEL');
+    const tech = checks.querySelectorAll('.tech-evidence')[0]!;
+    expect(tech).toBeTruthy();
+    expect(tech.open).toBe(false);
+    expect(tech.textContent).toContain('接口证据 · POST /api/item.json');
+    expect(tech.textContent).toContain('POST');
+    expect(tech.textContent).toContain('/api/item.json');
+    expect(tech.textContent).toContain('trace-pass');
+    expect(tech.textContent).toContain('响应原文');
+    expect(checks.querySelectorAll('.backend-diagnostics')).toHaveLength(0);
+    expect(dom.el('context').querySelectorAll('.backend-diagnostics')).toHaveLength(0);
   });
 
-  it('非 JSON 响应保留原文，旧报告无 assertions 时 observation 仍可见', () => {
-    const html = renderReportHtml(renderData({
+  it('非 JSON 响应保留原文，未关联文本检查不借整步 API', () => {
+    const dom = renderDom(renderData({
       cases: [{
         id: 'TC-01',
         name: '旧报告',
@@ -514,6 +612,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
           action: '旧步骤',
           observation: '旧报告观察事实',
           duration: '10ms',
+          eventIds: ['obs', 'as1'],
           apis: [{
             method: 'GET',
             path: '/legacy.txt',
@@ -522,14 +621,28 @@ describe('report 真实判定回归（review-r2 反例）', () => {
             respBody: 'plain text response',
           }],
         }],
+        events: [
+          {
+            id: 'obs', sequence: 1, type: 'observation', kind: 'response', status: 'pass',
+            actual: 'plain text response', actualStatus: 'present',
+          },
+          {
+            id: 'as1', sequence: 2, type: 'assert', kind: 'text', status: 'pass', executed: true,
+            expect: { contains: 'plain text response' }, resolvedExpected: 'plain text response',
+            actual: 'plain text response', actualStatus: 'present',
+          },
+        ],
       }],
       result: 'BLOCKED',
       coverage: { plan: null, executed: ['旧步骤'], missing: [], unplanned: [] },
     }));
-    expect(html).toContain('<div class="step-obs">旧报告观察事实</div>');
-    expect(html).not.toContain('class="assert-table"');
-    expect(html).toContain('plain text response');
-    expect(html).not.toContain('class="json-response-tree"');
+    // 主时间线只展示业务检查，原始 observation 由检查结果与「原始 trace」承载
+    expect(dom.el('timeline').textContent).toContain('检查：文本包含');
+    expect(dom.el('timeline').textContent).not.toContain('observation');
+    expect(dom.el('action').textContent).toContain('plain text response');
+    expect(dom.el('checks').querySelectorAll('.tech-evidence')).toHaveLength(0);
+    expect(dom.payload.cases[0].steps[0].apis[0].respBody).toBe('plain text response');
+    expect(dom.payload.cases[0].events[0].actual).toBe('plain text response');
   });
 
   it('runtime replay 不伪造覆盖计划，executed 使用 IR step 业务标题', () => {
@@ -613,10 +726,11 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const sp = shot(id, 'a1');
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'ok' }, actual: 'ok', evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    expect(html).not.toContain('class="trace-box"');
-    // traceId 仍在可折叠的 headers 里
-    expect(html).toContain('trace-pass-200');
+    const { json } = await report(id);
+    const checks = renderDom(json).el('checks');
+    expect(checks.querySelectorAll('.trace-id')).toHaveLength(0);
+    // traceId 仍在默认关闭的技术证据里
+    expect(checks.querySelectorAll('.tech-evidence')[0]!.textContent).toContain('trace-pass-200');
   });
 
   it('FAIL 步骤 + 200 接口有 traceId → 展示 trace-box', async () => {
@@ -626,9 +740,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const sp = shot(id, 'a1');
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: false, expect: { path: 'data.tip', op: '==', value: 'expected' }, actual: 'actual', evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    expect(html).toContain('class="trace-box"');
-    expect(html).toContain('trace-fail-200');
+    const { json } = await report(id);
+    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    expect(traces).toHaveLength(1);
+    expect(traces[0]!.textContent).toContain('trace-fail-200');
   });
 
   it('PASS 步骤 + 500 接口有 traceId → 展示 trace-box', async () => {
@@ -639,9 +754,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     // api assert 引用 r1，使 request 关联到步骤；步骤本身 pass（assert 通过），但 HTTP 500 仍应展示 trace-box
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'error', op: '==', value: 'internal' }, actual: 'internal', evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    expect(html).toContain('class="trace-box"');
-    expect(html).toContain('trace-err-500');
+    const { json } = await report(id);
+    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    expect(traces).toHaveLength(1);
+    expect(traces[0]!.textContent).toContain('trace-err-500');
   });
 
   it('BLOCKED 步骤 + 200 接口有 traceId → 展示 trace-box', async () => {
@@ -651,9 +767,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     // 无断言后完成态截图 → BLOCKED
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [] });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'ok' }, actual: 'ok', evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    expect(html).toContain('class="trace-box"');
-    expect(html).toContain('trace-blocked-200');
+    const { json } = await report(id);
+    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    expect(traces).toHaveLength(1);
+    expect(traces[0]!.textContent).toContain('trace-blocked-200');
   });
 
   // ── focused display ──
@@ -665,15 +782,17 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const sp = shot(id, 'a1');
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'hello' }, actual: 'hello', evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    expect(html).toContain('class="api-focused"');
-    expect(html).toContain('data.tip');
-    expect(html).toContain('hello');
-    expect(html).toContain('class="full-response"');
-    // 噪音字段不在 focused 里
-    const focusedMatch = html.match(/class="api-focused"[\s\S]*?<\/div>\s*<details/);
-    expect(focusedMatch).toBeTruthy();
-    expect(focusedMatch![0]).not.toContain('noise');
+    const { json } = await report(id);
+    const checks = renderDom(json).el('checks');
+    const card = checks.querySelectorAll('.check')[0]!;
+    // focused 等价：断言路径、期望与实测在首屏对照里
+    expect(card.textContent).toContain('data.tip');
+    expect(card.textContent).toContain('hello');
+    // 全量响应默认折叠，噪音字段不进对照行
+    const tech = card.querySelectorAll('.tech-evidence')[0]!;
+    expect(tech.open).toBe(false);
+    expect(tech.textContent).toContain('noise');
+    expect(card.querySelectorAll('.facts')[0]!.textContent).not.toContain('noise');
   });
 
   it('无 assertions 或 path 为空 → 降级全量展示，不含 api-focused', async () => {
@@ -684,9 +803,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     // text 类型断言，非 api
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'text', expect: { contains: 'hello' }, actual: 'hello', pass: true, evidence: [] });
-    const { html } = await report(id);
-    expect(html).not.toContain('class="api-focused"');
-    expect(html).not.toContain('class="full-response"');
+    const { json } = await report(id);
+    const checks = renderDom(json).el('checks');
+    expect(checks.querySelectorAll('.trace-id')).toHaveLength(0);
+    expect(checks.textContent).toContain('hello');
   });
 
   it('focused display 基础类型内联：string/number/boolean/null', async () => {
@@ -699,23 +819,17 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'n', op: '==', value: 42 }, actual: 42, evidence: [{ req_id: 'r1' }] });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'b', op: '==', value: true }, actual: true, evidence: [{ req_id: 'r1' }] });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'x', op: '==', value: null }, actual: null, evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    // string 带引号（HTML 转义）
-    expect(html).toContain('class="api-tree-str"');
-    expect(html).toContain('&quot;hello&quot;');
-    // number 直接展示
-    expect(html).toContain('class="api-tree-number"');
-    expect(html).toContain('>42<');
-    // boolean 直接展示
-    expect(html).toContain('class="api-tree-boolean"');
-    expect(html).toContain('>true<');
-    // null 灰色斜体
-    expect(html).toContain('class="api-tree-null"');
-    expect(html).toContain('>null<');
-    // 不含 details（基础类型不折叠）
-    const focusedMatch = html.match(/class="api-focused"[\s\S]*?<\/div>\s*<details class="full-response"/);
-    expect(focusedMatch).toBeTruthy();
-    expect(focusedMatch![0]).not.toContain('<details><summary');
+    const { json } = await report(id);
+    const facts = renderDom(json).el('checks').querySelectorAll('.check')
+      .flatMap(card => card.querySelectorAll('.facts').slice(0, 1));
+    const text = facts.map(item => item.textContent).join('');
+    // 字符串与数值/布尔/null 保持类型区别
+    expect(text).toContain('"hello"');
+    expect(text).toContain('42');
+    expect(text).toContain('true');
+    expect(text).toContain('null');
+    // 基础类型不折叠
+    expect(facts.some(item => item.querySelectorAll('details').length > 0)).toBe(false);
   });
 
   it('focused display 对象/数组嵌套折叠：details + summary', async () => {
@@ -725,15 +839,194 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     const sp = shot(id, 'a1');
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data', op: 'exists' }, actual: null, evidence: [{ req_id: 'r1' }] });
-    const { html } = await report(id);
-    // 对象折叠：{list, meta}
-    expect(html).toContain('class="api-tree-summary"');
-    expect(html).toContain('{list, meta}');
-    // 数组折叠：[2 项]
-    expect(html).toContain('[2 项]');
-    // 嵌套缩进
-    expect(html).toContain('class="api-tree-indent"');
-    // 逗号
-    expect(html).toContain('class="api-tree-comma"');
+    const { json } = await report(id);
+    const checks = renderDom(json).el('checks');
+    const tech = checks.querySelectorAll('.tech-evidence')[0]!;
+    // 完整对象与数组原文默认折叠保留
+    expect(tech.open).toBe(false);
+    expect(tech.textContent).toContain('"list":[1,2]');
+    expect(tech.textContent).toContain('"meta":{"count":2}');
+  });
+
+  it('主时间线只展示业务步骤，原始 action/observation/screenshot 默认隐藏', () => {
+    const dom = renderDom(renderData({
+      cases: [{
+        id: 'TC-01',
+        name: '时间线',
+        result: 'PASS',
+        steps: [{ index: 1, status: 'pass', action: '打开页面并检查文本', observation: 'ok', duration: '10ms', eventIds: ['a1', 'as1'] }],
+        events: [
+          { id: 'o1', sequence: 1, type: 'observation', kind: 'request', status: 'pass', actual: '200' },
+          { id: 'a1', sequence: 2, type: 'action', kind: 'open', status: 'pass', executed: true, actionId: 'a1', intent: '打开 FDE 详情页' },
+          { id: 'a1:screenshot', sequence: 3, type: 'screenshot', kind: 'screenshot', status: 'pass', actionId: 'a1' },
+          { id: 'as1', sequence: 4, type: 'assert', kind: 'text', status: 'pass', executed: true, actionId: 'a1', expect: { contains: '草稿' }, actual: '草稿' },
+        ],
+      }],
+      coverage: { plan: null, executed: ['打开页面并检查文本'], missing: [], unplanned: [] },
+    }));
+    const timeline = dom.el('timeline').textContent;
+    expect(timeline).toContain('打开 FDE 详情页');
+    expect(timeline).toContain('检查：文本包含');
+    expect(timeline).not.toContain('action / open');
+    expect(timeline).not.toContain('screenshot / screenshot');
+    expect(timeline).not.toContain('observation');
+  });
+
+  const apiCase = (): ReportData['cases'][number] => ({
+    id: 'TC-API',
+    name: '接口监控断言',
+    result: 'FAIL',
+    steps: [{
+      index: 1,
+      status: 'fail',
+      group: '接口监控',
+      action: '接口监控断言',
+      observation: '库存接口返回 0，期望 10',
+      duration: '1350ms',
+      actionIds: ['a1'],
+      eventIds: ['a1', 'as1'],
+      assertions: [{ kind: 'api', expect: { path: 'data.stock', op: '==', value: 10 }, actual: 0, pass: false }],
+      apis: [{
+        reqId: 'r1', method: 'GET', path: '/api/item/stock',
+        url: 'https://example.test/api/item/stock?itemId=123', status: '200',
+        reqBody: '{"itemId":123}', respHeaders: 'Content-Type: application/json',
+        respBody: '{"data":{"stock":0}}', traceId: 'trace-api-1',
+      }],
+    }],
+    events: [
+      { id: 'a1', sequence: 1, type: 'action', kind: 'open', status: 'pass', actionId: 'a1', intent: '打开商品详情页', executed: true },
+      {
+        id: 'as1', sequence: 2, type: 'assert', kind: 'api', status: 'fail', actionId: 'a1', group: '接口监控',
+        executed: true, expect: { path: 'data.stock', op: '==', value: 10 }, resolvedExpected: 10,
+        actual: 0, actualStatus: 'present', evidence: [{ req_id: 'r1' }],
+      },
+    ],
+  });
+
+  it('多用例：用例表展示独立结果，默认打开失败用例', () => {
+    const dom = renderDom(renderData({
+      result: 'FAIL',
+      cases: [renderData().cases[0]!, apiCase()],
+      coverage: { plan: ['A', 'B'], executed: ['A', 'B'], missing: [], unplanned: [] },
+    }));
+    expect(dom.el('cases').querySelectorAll('.case-row')).toHaveLength(2);
+    expect(dom.el('case-count').textContent).toContain('2 个用例');
+    expect(dom.el('case-count').textContent).toContain('1 通过');
+    expect(dom.el('case-count').textContent).toContain('1 失败');
+    expect(dom.el('cases-section').hidden).toBe(false);
+    expect(dom.el('context').textContent).toContain('接口监控');
+    expect(dom.el('checks').textContent).toContain('接口断言');
+  });
+
+  it('接口断言：显示接口与状态，接口证据折叠，不露技术字段', () => {
+    const dom = renderDom(renderData({
+      result: 'FAIL',
+      cases: [apiCase()],
+      coverage: { plan: ['接口监控'], executed: ['接口监控'], missing: [], unplanned: [] },
+    }));
+    const checks = dom.el('checks').textContent;
+    expect(checks).toContain('接口断言 · GET /api/item/stock');
+    expect(checks).toContain('接口状态');
+    expect(checks).toContain('200');
+    expect(checks).toContain('data.stock');
+    expect(checks).toContain('10');
+    expect(checks).toContain('0');
+    expect(checks).not.toContain('技术字段');
+    expect(checks).not.toContain('事件 ID');
+    const evidence = dom.el('checks').querySelectorAll('.tech-evidence')[0]!;
+    expect(evidence.open).toBe(false);
+    expect(evidence.textContent).toContain('接口证据');
+    expect(evidence.textContent).toContain('trace-api-1');
+    expect(evidence.textContent).toContain('{"data":{"stock":0}}');
+    expect(evidence.textContent).not.toMatch(/\d+ 字符/);
+    const stage = dom.el('image-stage').textContent;
+    expect(stage).toContain('GET');
+    expect(stage).toContain('/api/item/stock');
+    expect(stage).toContain('HTTP 200');
+    expect(stage).toContain('trace-api-1');
+    expect(dom.html).not.toContain('id="image-tools"');
+    expect(dom.html).not.toContain('id="enlarge"');
+    expect(dom.el('flow-replay').hidden).toBe(true);
+    expect(dom.html).not.toContain('id="autoplay"');
+    expect(stage).not.toMatch(/\d+ 字符/);
+  });
+
+  it('全流程回放只在有截图序列时出现', () => {
+    const dom = renderDom(renderData({
+      cases: [{
+        id: 'TC-SHOT',
+        name: '截图序列',
+        result: 'PASS',
+        steps: [{ index: 1, status: 'pass', action: '打开页面', observation: 'ok', duration: '1s', eventIds: ['a1', 'a2'] }],
+        events: [
+          { id: 'a1', sequence: 1, type: 'action', kind: 'open', status: 'pass', actionId: 'a1', intent: '打开页面', executed: true },
+          { id: 'a2', sequence: 2, type: 'action', kind: 'click', status: 'pass', actionId: 'a2', intent: '点击按钮', executed: true },
+        ],
+        images: [
+          { id: 'i1', eventId: 'a1', actionId: 'a1', sequence: 1, phase: 'after_action', label: '打开页面', src: `data:image/png;base64,${PNG}` },
+          { id: 'i2', eventId: 'a2', actionId: 'a2', sequence: 2, phase: 'after_action', label: '点击按钮', src: `data:image/png;base64,${PNG}` },
+        ],
+      }],
+      coverage: { plan: null, executed: ['打开页面'], missing: [], unplanned: [] },
+    }));
+    expect(dom.el('flow-replay').hidden).toBe(false);
+    expect(dom.html).not.toContain('id="autoplay"');
+  });
+
+  it('全流程回放优先消费 flow 帧', () => {
+    const dom = renderDom(renderData({
+      cases: [{
+        id: 'TC-FLOW',
+        name: '全流程帧',
+        result: 'PASS',
+        steps: [{ index: 1, status: 'pass', action: '打开页面', observation: 'ok', duration: '1s', eventIds: ['a1'] }],
+        events: [{ id: 'a1', sequence: 1, type: 'action', kind: 'open', status: 'pass', actionId: 'a1', intent: '打开页面', executed: true }],
+        flow: {
+          startedAt: 1, endedAt: 101,
+          frames: [
+            { src: `data:image/png;base64,${PNG}`, startedAt: 1, label: '全流程帧 1' },
+            { src: `data:image/png;base64,${PNG}`, startedAt: 50, label: '全流程帧 2' },
+          ],
+        },
+      }],
+      coverage: { plan: null, executed: ['打开页面'], missing: [], unplanned: [] },
+    }));
+    expect(dom.payload.cases[0].flow.frames).toHaveLength(2);
+    expect(dom.el('flow-replay').hidden).toBe(false);
+  });
+
+  it('刷新动作展示自动截图，断言步骤展示完成态截图', () => {
+    const autoSrc = `data:image/png;base64,${PNG}`;
+    const finalSrc = 'data:image/png;base64,AAAA';
+    const cases = (assertStatus: string) => renderData({
+      coverage: { plan: null, executed: ['刷新页面'], missing: [], unplanned: [] },
+      cases: [{
+        id: 'TC-IMG',
+        name: '截图优先级',
+        result: assertStatus === 'pass' ? 'PASS' : 'FAIL',
+        steps: [{
+          index: 1, status: 'pass', action: '刷新页面', observation: '完成', duration: '1s',
+          eventIds: ['a1', 'a1:screenshot', 'assert_1', 'shot_final'], actionIds: ['a1'], screenshotPath: '/final.png',
+        }],
+        events: [
+          { id: 'a1', sequence: 1, type: 'action', kind: 'refresh', status: 'pass', actionId: 'a1', intent: '刷新页面' },
+          { id: 'a1:screenshot', sequence: 2, type: 'screenshot', kind: 'screenshot', status: 'pass', actionId: 'a1', intent: '刷新页面' },
+          { id: 'assert_1', sequence: 3, type: 'assert', kind: 'text', status: assertStatus, actionId: 'a1' },
+          { id: 'shot_final', sequence: 4, type: 'screenshot', kind: 'screenshot', status: 'pass', actionId: 'a1', intent: '完成态' },
+        ],
+        images: [
+          { id: 'auto', eventId: 'a1:screenshot', actionId: 'a1', sequence: 2, phase: 'after_action', label: '刷新中', src: autoSrc },
+          { id: 'final', eventId: 'shot_final', actionId: 'a1', sequence: 4, label: '完成态', src: finalSrc },
+        ],
+      }],
+    });
+    const actionDom = renderDom(cases('pass'));
+    expect(actionDom.el('image-stage').querySelector('img')?.src).toBe(autoSrc);
+    expect(actionDom.el('images').children.map(option => option.textContent)).toEqual(['自动截图 · 刷新中', '独立截图 · 完成态']);
+    expect(actionDom.el('images').children[0]?.getAttribute('aria-pressed')).toBe('true');
+    const assertDom = renderDom(cases('fail'));
+    expect(assertDom.el('image-stage').querySelector('img')?.src).toBe(finalSrc);
+    expect(assertDom.el('images').children.map(option => option.textContent)).toEqual(['独立截图 · 完成态', '自动截图 · 刷新中']);
+    expect(assertDom.el('images').children[0]?.getAttribute('aria-pressed')).toBe('true');
   });
 });

@@ -62,5 +62,6 @@ e2et session stop -s '<sid>'
 ```
 
 - sid 取启动返回的 `data.session_id`。`--env` 默认 default，只是标签，不选择 URL、身份或环境凭据。
+- 本次有独立验收说明时，先核 `commands session start --json` 支持 `--acceptance '<file>'`，再附加到已选定的身份/浏览器参数上；CLI 在浏览器启动前校验冻结，内部快照和环境传递由 CLI 管理。用法见 [acceptance.md](acceptance.md#执行前的验收说明)，仅汇总或收尾不重开会话、不补快照。
 - 本轮创建的会话在完成/失败/阻断后都 stop，再按 [acceptance.md](acceptance.md) report。`data.result` 为 pass/fail/blocked/aborted；pass 才是正常通过前置。
 - 已结束会话可直接生成报告；不要为收尾重启会话或重做页面操作。

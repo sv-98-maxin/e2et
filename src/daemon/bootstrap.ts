@@ -207,6 +207,7 @@ export async function defaultBootstrap(
           : await launchChromium(executable, userDataDir);
         ensureNotStopping();
         writeMeta({
+          ...readMeta(sessionId),
           id: sessionId,
           pid: process.pid,
           socket: socketPath,

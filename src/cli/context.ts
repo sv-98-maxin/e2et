@@ -45,8 +45,8 @@ export function emitOk(d: Deps, data: unknown): number {
   return EXIT_OK;
 }
 
-export function emitError(d: Deps, code: string, message: string, hint?: string, exit = EXIT_VALIDATION): number {
-  d.stdout(JSON.stringify({ ok: false, error: { code, message, ...(hint ? { hint } : {}) } }));
+export function emitError(d: Deps, code: string, message: string, hint?: string, exit = EXIT_VALIDATION, evidence?: Record<string, string>): number {
+  d.stdout(JSON.stringify({ ok: false, error: { code, message, ...(hint ? { hint } : {}), ...(evidence ? { evidence } : {}) } }));
   return exit;
 }
 

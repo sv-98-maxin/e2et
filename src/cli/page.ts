@@ -89,6 +89,7 @@ async function pageExecute(d: Deps, argv: string[]): Promise<number> {
     expression: values['expression'],
     intent: values['--intent'],
     await_promise: values['--await-promise'] === 'true',
+    ...(values['--group'] !== undefined ? { group: values['--group'] } : {}),
   });
 }
 

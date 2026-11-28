@@ -259,9 +259,17 @@ const CaptureFromElement = z.object({
 export const CaptureSchema = z.union([CaptureFromApi, CaptureFromElement]);
 export type Capture = z.infer<typeof CaptureSchema>;
 
+const ReportIdentity = z.string().refine(value => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), '报告身份必须为非空且无控制符的字符串');
+export const ReportRefSchema = z.object({
+  group: ReportIdentity.optional(),
+  source_event_id: ReportIdentity.optional(),
+  check_id: ReportIdentity.optional(),
+}).strict();
+export type ReportRef = z.infer<typeof ReportRefSchema>;
+
 export const CheckSchema = z.union([
-  z.object({ assert: AssertSchema, frame: z.array(FrameSchema).optional() }),
-  z.object({ capture: CaptureSchema, frame: z.array(FrameSchema).optional() }),
+  z.object({ assert: AssertSchema, frame: z.array(FrameSchema).optional(), report_ref: ReportRefSchema.optional() }),
+  z.object({ capture: CaptureSchema, frame: z.array(FrameSchema).optional(), report_ref: ReportRefSchema.optional() }),
 ]);
 export type Check = z.infer<typeof CheckSchema>;
 
@@ -288,6 +296,7 @@ export const StepSchema = z.object({
   id: z.string().min(1),
   intent: z.string(),
   action: ActionKind,
+  report_ref: ReportRefSchema.optional(),
   frame: z.array(FrameSchema).optional(),
   locator: LocatorSchema.optional(),
   fallback: z.array(LocatorSchema).max(2).optional(),

@@ -86,6 +86,40 @@ const target = (kind: 'ir' | 'test' | 'fixture') => kind === 'ir'
     : path.join(targetRoot(), 'cases/fixtures/verify-case', uploadName);
 const INITIAL_FD_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
 
+/** 假 runner 必须产出与真 runtime 同构的 Playwright 产物，否则新验收链路判定 BLOCKED。 */
+function writePassingEvidence(runDir: string): void {
+  const runId = path.basename(runDir);
+  const attachment = (name: string, value: unknown) => ({
+    name, contentType: 'application/json', body: Buffer.from(JSON.stringify(value)).toString('base64'),
+  });
+  fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({
+    suites: [{ specs: [{ id: 'spec-1', title: 'verify-case', tests: [{ results: [{
+      status: 'passed', duration: 1,
+      attachments: [
+        attachment('ir-report', {
+          report_schema_version: 2, result: 'PASS', mocked: false,
+          cases: [{
+            id: 'case-1', name: 'verify-case', result: 'PASS',
+            steps: [{ id: 's1', status: 'pass' }],
+            events: [{ id: 'e1', sequence: 0, type: 'action', kind: 'open', status: 'pass' }],
+            images: [], run: { id: runId, mode: 'replay', status: 'PASS' },
+          }],
+        }),
+        attachment('replay-environment', { auth_source: 'imported', browser_source: 'managed' }),
+      ],
+    }] }] }] }],
+    stats: { expected: 1, unexpected: 0, skipped: 0, flaky: 0 },
+  }));
+  fs.mkdirSync(path.join(runDir, 'html-report'), { recursive: true });
+  fs.writeFileSync(path.join(runDir, 'html-report', 'index.html'),
+    '<html><template id="playwrightReportBase64">data:application/zip;base64,fixture</template></html>');
+}
+
+const passingRunner = async (_env: NodeJS.ProcessEnv, _root: string, testFile: string): Promise<number> => {
+  writePassingEvidence(path.dirname(path.dirname(testFile)));
+  return 0;
+};
+
 function writeOldCase(bytes = 'old') {
   fs.mkdirSync(path.dirname(target('test')), { recursive: true });
   fs.writeFileSync(target('test'), bytes);
@@ -115,7 +149,7 @@ beforeEach(() => {
   fs.mkdirSync(path.dirname(traceFile), { recursive: true });
   ir = caseIR(); events = caseTrace(); stdout = [];
   writeSources();
-  deps = { env: process.env, homeDir: home, stdout: (line) => stdout.push(line), stderr: () => {}, playwrightRunner: async () => 0 };
+  deps = { env: process.env, homeDir: home, stdout: (line) => stdout.push(line), stderr: () => {}, playwrightRunner: passingRunner };
 });
 afterEach(() => {
   if (previous === undefined) delete process.env.E2ET_HOME;
@@ -267,6 +301,7 @@ describe('verify 私有运行与 bytes 快照', () => {
         expect(fs.realpathSync(path.join(runDir, 'node_modules', name))).toBe(fs.realpathSync(path.dirname(cliRequire.resolve(`${name}/package.json`))));
       }
       if (outcome === 'throw') throw new Error('runner boom');
+      if (outcome === 0) writePassingEvidence(runDir);
       return outcome as number;
     };
     expect(await dispatch(['verify', source, '--auth', 'imported', '--browser', 'managed'], deps)).toBe(outcome === 0 ? 0 : 1);
@@ -300,7 +335,7 @@ describe('land 目标预检、原子替换与回滚', () => {
     expect(fs.readFileSync(target('test'), 'utf8')).toBe('protected');
   });
   it('验证期间目标出现：拒绝且不覆盖竞争目录', async () => {
-    deps.playwrightRunner = async () => { writeOldCase('racer'); return 0; };
+    deps.playwrightRunner = async (_env, _root, testFile) => { writeOldCase('racer'); writePassingEvidence(path.dirname(path.dirname(testFile))); return 0; };
     expect(await dispatch(['land', source, '--force'], deps)).toBe(1);
     expect(envelope().error.code).toBe('ALREADY_EXISTS');
     expect(fs.readFileSync(target('test'), 'utf8')).toBe('racer');
@@ -482,6 +517,7 @@ describe('case list / case run', () => {
       expect(runnerDeps.env.E2ET_REPLAY_BROWSER).toBe('managed');
       expect(testTimeoutMs).toBeGreaterThan(0);
       executed = fs.readFileSync(testFile);
+      writePassingEvidence(path.dirname(path.dirname(testFile)));
       return 0;
     };
     expect(await dispatch(['case', 'run', 'verify-case', '--auth', 'imported', '--browser', 'managed'], deps)).toBe(0);
@@ -531,7 +567,11 @@ describe('CLI 依赖与 render 原子写', () => {
       "import * as fs from 'node:fs';", "import * as path from 'node:path';",
       "const config = process.argv.at(-1);", "const runDir = path.dirname(config);",
       'fs.writeFileSync(' + JSON.stringify(probe) + ', JSON.stringify({exec:process.execPath,argv:process.argv,cwd:process.cwd(),config,content:fs.readFileSync(config,"utf8")}));',
-      "fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({suites:[{suites:[],specs:[{tests:[{results:[{status: " + (status === 0 ? '"passed"' : '"failed"') + "}]}]}]}], stats:{expected:" + (status === 0 ? 1 : 0) + ",unexpected:" + (status === 0 ? 0 : 1) + ",skipped:0,flaky:0}}));",
+      "const att = (name, value) => ({ name, contentType: 'application/json', body: Buffer.from(JSON.stringify(value)).toString('base64') });",
+      "const runId = path.basename(runDir);",
+      "const ir = { report_schema_version: 2, result: 'PASS', mocked: false, cases: [{ id: 'c1', name: 'verify-case', result: 'PASS', steps: [{ id: 's1', status: 'pass' }], events: [{ id: 'e1', sequence: 0, type: 'action', kind: 'open', status: 'pass' }], images: [], run: { id: runId, mode: 'replay', status: 'PASS' } }] };",
+      "const attachments = " + (status === 0 ? "[att('ir-report', ir), att('replay-environment', { auth_source: 'imported', browser_source: 'managed' })]" : '[]') + ";",
+      "fs.writeFileSync(path.join(runDir, 'report.json'), JSON.stringify({ suites: [{ specs: [{ id: 'spec-1', title: 'verify-case', tests: [{ results: [{ status: " + (status === 0 ? "'passed'" : "'failed'") + ", duration: 1, attachments }] }] }] }], stats: { expected: " + (status === 0 ? 1 : 0) + ", unexpected: " + (status === 0 ? 0 : 1) + ", skipped: 0, flaky: 0 } }));",
       "fs.mkdirSync(path.join(runDir, 'html-report'), {recursive:true});",
       "fs.writeFileSync(path.join(runDir, 'html-report', 'index.html'), '<html><template id=\"playwrightReportBase64\">data:application/zip;base64,fixture</template></html>');",
       'process.exit(' + status + ');',
@@ -542,7 +582,7 @@ describe('CLI 依赖与 render 原子写', () => {
     finally { packageRootSpy.mockRestore(); }
     const evidence = JSON.parse(fs.readFileSync(probe, 'utf8'));
     expect(evidence.argv.slice(1, 4)).toEqual([fs.realpathSync(cli), 'test', '--config']);
-    expect(evidence.content).toContain('metadata: {"e2et_version":"0.1.0-beta","playwright_version":"1.64.1"}');
+    expect(evidence.content).toContain('metadata: {"e2et_version":"0.1.0-beta","playwright_version":"1.64.1","e2et_run":{"id":');
     expect(fs.existsSync(evidence.config)).toBe(false);
   });
   it('render 用同目录临时文件替换；rename 失败旧文件不变', async () => {
