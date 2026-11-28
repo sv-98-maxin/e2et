@@ -715,7 +715,9 @@ export class ActionRunner {
     if (!cdp) return { error: 'NO_ACTIVE_PAGE' };
     const startedAt = Date.now();
     try {
-      const data = await captureScreenshot(cdp, false);
+      let data: string;
+      try { data = await captureScreenshot(cdp, true); }
+      catch { data = await captureScreenshot(cdp, false); }
       const buf = Buffer.from(data, 'base64');
       const shotsDir = path.join(e2etRoot(), 'workspace', 'screenshots');
       ensurePrivateDir(shotsDir, true);

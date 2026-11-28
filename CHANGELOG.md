@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- Rebuild the acceptance report around a flat execution-step stream: every step carries its own result, checks, and screenshots, with a sticky summary header and a case list beside the case detail.
+- Apply one desktop viewport to screenshots, flow capture, and replay, overridable through `E2ET_VIEWPORT=<width>x<height>`. Flow frames keep full page width instead of being cropped by the browser window.
+- Keep check details next to the step that produced them instead of duplicating the whole acceptance plan in a separate section.
+
 ## 0.2.0
 
 - Generate schema 2 Source and replay reports with ordered events, linked screenshots, execution errors, and explicit evidence for checks that did not run.

@@ -375,7 +375,9 @@ export class PageCommands {
   private async saveScreenshot(cdp: import('../browser/daemon-client.js').CdpSession): Promise<{ path?: string; error?: string; startedAt: number; endedAt: number }> {
     const startedAt = Date.now();
     try {
-      const data = await captureScreenshot(cdp, false);
+      let data: string;
+      try { data = await captureScreenshot(cdp, true); }
+      catch { data = await captureScreenshot(cdp, false); }
       return { path: this.writeScreenshot(Buffer.from(data, 'base64')), startedAt, endedAt: Date.now() };
     } catch (e) {
       return { error: redactText((e as Error).message), startedAt, endedAt: Date.now() };

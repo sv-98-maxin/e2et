@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import type { JSONReport, JSONReportSuite, JSONReportTestResult } from '@playwright/test/reporter';
 import { packageRoot, readPackageVersion } from '../package-version.js';
 import { PLAYWRIGHT_VERSION } from '../shared/versions.js';
+import { resolveViewport } from '../shared/viewport.js';
 import { replayTimeoutMs } from '../wait-timeout.js';
 import { e2etRoot } from '../daemon/session-meta.js';
 import { linkedPath } from '../path-safety.js';
@@ -344,7 +345,7 @@ export async function runPlaywright(
       `  timeout: ${testTimeoutMs}, retries: 0,`,
       `  metadata: ${JSON.stringify({ e2et_version: readPackageVersion(packageRoot), playwright_version: PLAYWRIGHT_VERSION, e2et_run: receipt, e2et_acceptance: safeAcceptance })},`,
       `  reporter: [['line'], ['json', { outputFile: ${JSON.stringify(reportJson)} }], ['html', { open: 'never', outputFolder: ${JSON.stringify(reportHtml)} }]],`,
-      `  use: { headless: true, viewport: { width: 1280, height: 720 } },`,
+      `  use: { headless: true, viewport: ${JSON.stringify(resolveViewport(env))} },`,
       '});',
     ].join('\n'));
     const result = spawnSync(process.execPath, [cli, 'test', '--config', tmpConfig], {

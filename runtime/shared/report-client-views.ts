@@ -19,13 +19,6 @@ export const reportClientViews = String.raw`
     details.append(summary, tools, original); container.append(details); return container;
   }
   function fact(list, label, value, present, empty, raw) { list.append(node('dt', '', label)); const cell = node('dd'); cell.append(valueNode(value, present, empty, raw)); list.append(cell); }
-  function linkedAction(caseIndex, event) {
-    if (event.type === 'action') return event;
-    if (!event.actionId) return undefined;
-    const exact = allEvents[caseIndex].find(action => action.type === 'action' && action.id === event.actionId);
-    const matches = allEvents[caseIndex].filter(action => action.type === 'action' && action.actionId === event.actionId);
-    return exact || (matches.length === 1 ? matches[0] : undefined);
-  }
   function apisForEvent(caseIndex, event) {
     const testCase = data.cases[caseIndex], steps = testCase.steps.concat(testCase.appendix || []);
     const step = steps.find(item => (item.eventIds || []).includes(event.id))
@@ -64,7 +57,8 @@ export const reportClientViews = String.raw`
     const direct = images.filter(image => image.eventId === event.id);
     const associated = actionId ? images.filter(image => image.actionId === actionId) : [];
     const candidates = event.type === 'action' ? Array.from(new Set(direct.concat(associated))) : direct.length ? direct : associated;
-    return candidates.sort((left, right) => {
+    const explicit = candidates.filter(image => image.phase !== 'after_action');
+    return (explicit.length ? explicit : candidates).sort((left, right) => {
       if (preferred) {
         if (left.eventId === preferred) return -1;
         if (right.eventId === preferred) return 1;
@@ -92,6 +86,8 @@ export const reportClientViews = String.raw`
     if (count) count.textContent = data.cases.length + ' 个用例 · ' + passed + ' 通过' + (failed ? ' · ' + failed + ' 失败' : '') + (blocked ? ' · ' + blocked + ' 阻断' : '');
     const section = get('cases-section');
     if (section) section.hidden = data.cases.length <= 1;
+    const center = get('center');
+    if (center) center.classList.toggle('multi', data.cases.length > 1);
   }
   function renderDirectory() {
     const root = get('scenarios'); root.replaceChildren();
@@ -159,75 +155,107 @@ export const reportClientViews = String.raw`
   }
   function actualFact(list, label, event) {
     const missing = { missing: '缺失', unavailable: '不可用', not_collected: '未采集' };
+    const present = (event.actualStatus === undefined || event.actualStatus === 'present') && has(event, 'actual');
+    const summary = present ? actualSummary(event) : undefined;
+    if (summary !== undefined) { humanFact(list, label, summary, true); return; }
     humanFact(list, label, event.actual, (event.actualStatus === undefined || event.actualStatus === 'present') && has(event, 'actual'), missing[event.actualStatus] || '未采集', undefined, true);
   }
+  function stepEvents(scope) { return scope.events.filter(event => event.type !== 'assert'); }
+  function stepChecks(scope, actionId) { return scope.events.filter(event => event.type === 'assert' && event.actionId === actionId); }
+  let checkRows = [];
+  function stepIndexOf(scope, event) {
+    const actionId = event.type === 'action' ? event.id : event.actionId;
+    if (!actionId) return undefined;
+    const index = stepEvents(scope).findIndex(item => item.type === 'action' && (item.id === actionId || item.actionId === actionId));
+    return index < 0 ? undefined : index + 1;
+  }
+  function checkRow(scope, plan, event, events) {
+    const state = plan ? planState(events) : status(event);
+    const row = node('article', 'check'); row.dataset.state = state;
+    if (plan) row.dataset.planId = plan.id;
+    if (events && events.length) row.dataset.eventIds = events.map(item => item.id).join(',');
+    const anchor = events.find(item => ['fail', 'error'].includes(status(item))) || event || events[0];
+    if (anchor) { row.dataset.eventId = anchor.id; if (anchor.actionId) row.dataset.actionId = anchor.actionId; }
+    const apis = anchor ? apisForEvent(scope.caseIndex, anchor) : [], api = apis[0];
+    const apiAssertion = Boolean(anchor && (anchor.kind === 'api' || anchor.kind === 'request'));
+    const label = plan ? plan.expectation : apiAssertion ? '接口断言 · ' + (api ? apiLabel(api) : '未关联') : assertionTitle(anchor);
+    const title = button(label, () => {
+      if (!anchor) return;
+      selectedCheck = anchor.id; selectCheck(anchor.id); focusStep(anchor.id);
+    }, 'check-name');
+    const head = node('div', 'check-head'); head.append(badge(state), title);
+    const bits = [];
+    if (anchor) {
+      const summary = actualSummary(anchor);
+      if (summary !== undefined) bits.push('实测 ' + summary);
+      const step = stepIndexOf(scope, anchor);
+      if (step !== undefined) bits.push('第 ' + step + ' 步');
+    } else bits.push('本次未核销');
+    if (events.length > 1) bits.push(events.length + ' 条记录');
+    head.append(node('span', 'check-meta', bits.join(' · ')));
+    row.append(head);
+    const details = node('details', 'check-detail');
+    details.append(node('summary', 'small muted', '详情'));
+    const facts = node('dl', 'facts');
+    if (!anchor) {
+      humanFact(facts, '期望', plan.expectation, true, undefined, undefined, true);
+      humanFact(facts, '本次结果', '未执行或未绑定', true);
+    } else {
+      const expected = assertionValue(anchor);
+      if (apiAssertion) {
+        if (api) humanFact(facts, '接口状态', api.status, has(api, 'status'), '未记录');
+        else humanFact(facts, '接口', '未关联接口证据', true);
+        const path = record(anchor.expect).path;
+        if (path) humanFact(facts, '断言字段', path, true);
+      } else humanFact(facts, '对象', targetSummary(anchor), true);
+      humanFact(facts, '条件', assertionCondition(anchor), true);
+      humanFact(facts, '期望', expected, expected !== undefined, '未记录', undefined, true);
+      actualFact(facts, '实测', anchor);
+      if (whitespaceNote(expected)) humanFact(facts, '空白检查', whitespaceNote(expected), true);
+    }
+    details.append(facts);
+    if (anchor) {
+      if (anchor.error) details.append(node('p', 'error-message', (anchor.error.code || '') + ' ' + anchor.error.message));
+      if (anchor.redacted || anchor.truncated) details.append(node('p', 'alert', [anchor.redacted && '已脱敏', anchor.truncated && '生产记录已截断'].filter(Boolean).join(' · ') + '，完整核验受此边界限制'));
+      const flagged = ['fail', 'error'].includes(status(anchor)) || apis.some(api => Number(api.status) >= 400) || scopeState(scope) !== 'pass';
+      const trace = apis.find(api => api.traceId);
+      if (flagged && trace) details.append(node('p', 'trace-id', 'traceId · ' + trace.traceId));
+      if (apis.length) {
+        const tech = node('details', 'tech-evidence');
+        tech.append(node('summary', '', '接口证据 · ' + apis.map(apiLabel).join(' / ')));
+        apis.forEach(api => tech.append(apiEvidence(api)));
+        details.append(tech);
+      }
+    }
+    row.append(details);
+    return row;
+  }
   function renderChecks(scope) {
-    const root = get('checks'); root.replaceChildren(); const used = new Set();
-    function checkCard(event, plan, bindings) {
-      const state = event ? status(event) : 'unverified', card = node('article', 'check');
-      const apis = event ? apisForEvent(scope.caseIndex, event) : [];
-      const api = apis[0];
-      const apiAssertion = Boolean(event && (event.kind === 'api' || event.kind === 'request'));
-      if (event) { card.dataset.eventId = event.id; card.dataset.actionId = event.actionId || ''; }
-      if (plan) card.dataset.planId = plan.id;
-      const heading = node('div', 'row between');
-      heading.append(button(plan ? plan.expectation : apiAssertion ? '接口断言 · ' + (api ? apiLabel(api) : '未关联') : assertionTitle(event), () => {
-        if (event) { selectedCheck = event.id; selectEvent(event.id); get('action').scrollIntoView({ block: 'start', behavior: 'smooth' }); }
-      }, 'check-name'), badge(state)); card.append(heading);
-      if (plan) {
-        const bindingInfo = node('p', 'small muted', bindings.length ? '已绑定 ' + bindings.length + ' 条执行记录' : '未绑定执行记录，不按标题核销');
-        bindingInfo.append(node('span', '', ' · '), badge(planState(bindings), '计划项 ' + states[planState(bindings)])); card.append(bindingInfo);
-      }
-      const list = node('dl', 'facts');
-      if (!event) {
-        humanFact(list, '期望', plan.expectation, true, undefined, undefined, true);
-        humanFact(list, '本次结果', '未执行或未绑定', true);
-      } else {
-        used.add(event.id);
-        const expected = assertionValue(event);
-        if (apiAssertion) {
-          if (api) humanFact(list, '接口状态', api.status, has(api, 'status'), '未记录');
-          else humanFact(list, '接口', '未关联接口证据', true);
-          const path = record(event.expect).path;
-          if (path) humanFact(list, '断言字段', path, true);
-        } else humanFact(list, '对象', targetSummary(event), true);
-        humanFact(list, '条件', assertionCondition(event), true);
-        humanFact(list, '期望', expected, expected !== undefined, '未记录', undefined, true);
-        actualFact(list, '实测', event);
-        if (whitespaceNote(expected)) humanFact(list, '空白检查', whitespaceNote(expected), true);
-        card.append(button('查看对应步骤与截图', () => { selectedCheck = event.id; selectEvent(event.id); get('action').scrollIntoView({ block: 'start', behavior: 'smooth' }); }, 'raw-link'));
-        if (event.error) card.append(node('p', 'error-message', (event.error.code || '') + ' ' + event.error.message));
-        if (event.redacted || event.truncated) card.append(node('p', 'alert', [event.redacted && '已脱敏', event.truncated && '生产记录已截断'].filter(Boolean).join(' · ') + '，完整核验受此边界限制'));
-      }
-      card.append(list);
-      if (event) {
-        const flagged = ['fail', 'error'].includes(status(event))
-          || apis.some(api => Number(api.status) >= 400) || scopeState(scope) !== 'pass';
-        const trace = apis.find(api => api.traceId);
-        if (flagged && trace) card.append(node('p', 'trace-id', 'traceId · ' + trace.traceId));
-        if (apis.length) {
-          const details = node('details', 'tech-evidence');
-          details.append(node('summary', '', '接口证据 · ' + apis.map(apiLabel).join(' / ')));
-          apis.forEach(api => details.append(apiEvidence(api)));
-          card.append(details);
-        }
-      }
-      root.append(card);
-    }
+    const root = get('checks'), section = get('checks-section');
+    root.replaceChildren(); checkRows = [];
     if (scope.scenario) {
-      root.append(node('p', 'section-label', '冻结验收计划 · 缺失项也保留'));
+      const handled = new Set();
       scope.scenario.checks.forEach(plan => {
-        const bindings = boundEvents(scope.caseIndex, scope.scenario, plan);
-        if (!bindings.length) checkCard(undefined, plan, []);
-        else bindings.forEach(event => checkCard(event, plan, bindings));
+        const events = boundEvents(scope.caseIndex, scope.scenario, plan);
+        events.forEach(event => handled.add(event.id));
+        const primary = events.find(event => ['fail', 'error'].includes(status(event))) || events[events.length - 1];
+        root.append(checkRow(scope, plan, primary, events));
       });
+      const extras = scope.events.filter(event => event.type === 'assert' && !handled.has(event.id));
+      if (extras.length) {
+        const details = node('details', 'check-extras');
+        details.append(node('summary', '', '计划外断言 · ' + extras.length + ' 条'));
+        extras.forEach(event => details.append(checkRow(scope, undefined, event, [event])));
+        root.append(details);
+      }
       if (!scope.scenario.checks.length) root.append(node('p', 'alert', '验收说明没有计划检查，需求覆盖未验证'));
+    } else {
+      scope.events.filter(event => event.type === 'assert').forEach(event => root.append(checkRow(scope, undefined, event, [event])));
     }
-    const asserts = scope.events.filter(event => event.type === 'assert' && !used.has(event.id));
-    if (asserts.length) root.append(node('p', 'section-label', scope.scenario ? '实际检查 · 尚未核销上述计划项' : '本次实际检查'));
-    asserts.forEach(event => checkCard(event));
-    if (!scope.scenario && !asserts.length) root.append(node('p', 'empty', '本范围没有正式断言。截图与辅助观察不计为断言。'));
-    get('check-count').textContent = root.querySelectorAll('.check').length + ' 项';
+    checkRows = Array.from(root.querySelectorAll('.check'));
+    const count = root.querySelectorAll('.check').length;
+    get('check-count').textContent = count ? count + ' 项' : '';
+    if (section) section.hidden = !root.children.length;
   }
   function actionMeta(event) {
     if (event.kind === 'open' || event.kind === 'refresh') return event.args && event.args.url || event.input || '';
@@ -247,23 +275,79 @@ export const reportClientViews = String.raw`
     if (typeof actual.resolvedValue === 'string') return actual.resolvedValue;
     return '完成';
   }
-  function renderTimeline(scope) {
-    const root = get('timeline'); root.replaceChildren(node('p', 'timeline-title', '执行步骤 · 动作与检查'));
-    scope.events.forEach((event, index) => {
-      const entry = button('', () => { selectedCheck = undefined; selectEvent(event.id); }, 'event'); entry.dataset.eventId = event.id;
-      const detail = node('div');
-      if (event.type === 'action') {
-        detail.append(node('div', 'event-title', actionTitle(event)), node('div', 'event-meta', [actionMeta(event), duration(event)].filter(Boolean).join(' · ')));
-      } else if (event.type === 'assert') {
-        const apis = apisForEvent(scope.caseIndex, event);
-        const object = apis.length ? apiLabel(apis[0]) : ['api', 'request'].includes(event.kind) ? '未关联接口证据' : targetSummary(event);
-        detail.append(node('div', 'event-title', '检查：' + assertionTitle(event)), node('div', 'event-meta', [assertionCondition(event), object].join(' · ')));
-      } else if (event.type === 'error') {
-        detail.append(node('div', 'event-title', '执行错误'), node('div', 'event-meta', event.error && event.error.message || event.kind));
-      } else {
-        detail.append(node('div', 'event-title', '辅助观察 · ' + event.kind), node('div', 'event-meta', ['observation', event.intent, states[status(event)]].filter(Boolean).join(' · ')));
-      }
-      entry.append(node('span', 'step-index', String(index + 1).padStart(2, '0')), detail, badge(status(event))); root.append(entry);
-    });
+  function stepTitle(event) {
+    if (event.type === 'action') return actionTitle(event);
+    if (event.type === 'assert') return '检查：' + assertionTitle(event);
+    if (event.type === 'error') return '执行错误';
+    return '辅助观察 · ' + event.kind;
+  }
+  function stepMeta(scope, event) {
+    if (event.type === 'action') {
+      const checks = stepChecks(scope, event.id), meta = [];
+      if (checks.length) meta.push('断言 ' + checks.filter(item => status(item) === 'pass').length + '/' + checks.length);
+      meta.push(duration(event));
+      return meta.filter(Boolean).join(' · ');
+    }
+    if (event.type === 'assert') return duration(event);
+    if (event.type === 'error') return event.error && event.error.message || event.kind;
+    return ['observation', event.intent, states[status(event)], duration(event)].filter(Boolean).join(' · ');
+  }
+  function stepFacts(scope, event) {
+    const facts = node('dl', 'facts');
+    if (event.type === 'action') {
+      humanFact(facts, '目标', actionMeta(event), Boolean(actionMeta(event)), '未记录');
+      humanFact(facts, '结果', actionOutcome(event), true);
+    } else if (event.type === 'assert') {
+      const expected = assertionValue(event), apis = apisForEvent(scope.caseIndex, event), api = apis[0];
+      const apiAssertion = event.kind === 'api' || event.kind === 'request';
+      if (apiAssertion) {
+        if (api) humanFact(facts, '接口状态', api.status, has(api, 'status'), '未记录');
+        else humanFact(facts, '接口', '未关联接口证据', true);
+        const path = record(event.expect).path;
+        if (path) humanFact(facts, '断言字段', path, true);
+      } else humanFact(facts, '对象', targetSummary(event), true);
+      humanFact(facts, '条件', assertionCondition(event), true);
+      humanFact(facts, '期望', expected, expected !== undefined, '未记录', undefined, true);
+      actualFact(facts, '实测', event);
+      if (whitespaceNote(expected)) humanFact(facts, '空白检查', whitespaceNote(expected), true);
+    } else if (event.type === 'error') {
+      humanFact(facts, '错误', event.error && event.error.message || event.kind, true);
+      if (event.error && event.error.code) humanFact(facts, '错误码', event.error.code, true);
+    } else {
+      actualFact(facts, '结果', event);
+      const apis = apisForEvent(scope.caseIndex, event);
+      if (apis.length) humanFact(facts, '接口', apis.map(apiLabel).join(' / '), true);
+      humanFact(facts, '时间', time(event.startedAt), true);
+    }
+    return facts;
+  }
+  function stepBlock(scope, event, index) {
+    const actionId = event.type === 'action' ? event.id : event.actionId;
+    const card = node('article', 'step');
+    card.dataset.eventId = event.id; card.dataset.state = status(event);
+    if (actionId) card.dataset.actionId = actionId;
+    const head = node('div', 'step-head');
+    head.append(node('span', 'step-index', String(index + 1).padStart(2, '0')), node('span', 'step-title', stepTitle(event)),
+      badge(status(event)), node('span', 'step-meta', stepMeta(scope, event)));
+    card.append(head, stepFacts(scope, event));
+    if (event.type === 'action' && /execute|script/i.test(event.kind)) card.append(node('p', 'alert', '脚本操作 · 只展示已记录脚本与返回，不推断为键盘或鼠标路径'));
+    if (event.error) card.append(node('p', 'error-message', (event.error.code || '') + ' ' + event.error.message));
+    const preview = stepPreview(scope, event);
+    if (preview) card.append(preview);
+    return card;
+  }
+  function stepPreview(scope, event) {
+    if (!imageCandidates(scope.caseIndex, event).length && !apisForEvent(scope.caseIndex, event).length) return undefined;
+    const preview = node('section', 'preview'), label = node('div', 'image-label'), picker = node('div', 'row small step-images');
+    const head = node('div', 'preview-head'), stage = node('div', 'image-stage');
+    head.append(label); preview.append(head, picker, stage);
+    renderImages(scope, event, label, picker, stage);
+    return preview;
+  }
+  function renderSteps(scope) {
+    const root = get('steps'); root.replaceChildren();
+    const steps = stepEvents(scope), events = steps.length ? steps : scope.events;
+    if (!events.length) { root.append(node('p', 'empty', '本范围没有可展示的业务步骤。')); return; }
+    events.forEach((event, index) => root.append(stepBlock(scope, event, index)));
   }
 `;

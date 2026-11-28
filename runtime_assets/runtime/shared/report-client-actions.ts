@@ -1,6 +1,6 @@
 /** 报告页浏览器脚本片段 3/3：事件选择、截图、播放、主题与初始化；与 core 同一 IIFE 作用域。 */
 export const reportClientActions = String.raw`
-  function renderApiPreview(scope, event) {
+  function renderApiPreview(scope, event, label, stage) {
     const apis = apisForEvent(scope.caseIndex, event);
     if (!apis.length) return false;
     const wrapper = node('div', 'api-preview');
@@ -16,17 +16,16 @@ export const reportClientActions = String.raw`
       fact(facts, '响应原文', api.respBody, has(api, 'respBody'), '未采集', true);
       card.append(head, facts); wrapper.append(card);
     });
-    get('image-label').textContent = '接口证据 · ' + apis.map(apiLabel).join(' / ');
-    get('image-stage').dataset.kind = 'api';
-    get('image-stage').append(wrapper);
+    label.textContent = '接口证据 · ' + apis.map(apiLabel).join(' / ');
+    stage.dataset.kind = 'api'; stage.append(wrapper);
     return true;
   }
-  function showImage(scope, event, image) {
-    selectedImage = image; const stage = get('image-stage'), label = get('image-label'); stage.replaceChildren(); stage.dataset.kind = ''; stage.classList.remove('empty');
-    get('images').querySelectorAll('button').forEach(option => option.setAttribute('aria-pressed', String(Boolean(image) && option.dataset.imageId === image.id)));
+  function paintImage(scope, event, image, label, picker, stage) {
+    stage.replaceChildren(); stage.dataset.kind = ''; stage.classList.remove('empty');
+    picker.querySelectorAll('button').forEach(option => option.setAttribute('aria-pressed', String(Boolean(image) && option.dataset.imageId === image.id)));
     if (!image || !imageSafe(image)) {
       stage.classList.add('empty');
-      if (renderApiPreview(scope, event)) { stage.classList.remove('empty'); return; }
+      if (renderApiPreview(scope, event, label, stage)) { stage.classList.remove('empty'); return; }
       label.textContent = status(event) === 'not_run' ? '本步骤未执行 · 未采集截图' : '本步骤未采集截图';
       stage.append(node('p', 'empty', image ? '截图数据无法解码；技术信息保留在原始 trace 中。' : status(event) === 'not_run' ? '此步骤未执行，没有截图。' : '没有与当前步骤关联的截图。无图不代表步骤通过。')); return;
     }
@@ -35,6 +34,15 @@ export const reportClientActions = String.raw`
     const picture = node('img'); picture.alt = image.label || ('步骤截图：' + actionTitle(event)); picture.src = image.src; picture.title = '点击全屏查看';
     picture.addEventListener('click', () => openImageViewer(image, event));
     picture.addEventListener('error', () => { if (picture.isConnected) { stage.classList.add('empty'); stage.replaceChildren(node('p', 'empty', '截图解码失败；技术信息保留在原始 trace 中。')); } }); stage.append(picture);
+  }
+  function renderImages(scope, event, label, picker, stage) {
+    const candidates = imageCandidates(scope.caseIndex, event);
+    picker.replaceChildren();
+    if (candidates.length > 1) candidates.forEach(image => {
+      const option = button((image.phase === 'after_action' ? '自动截图 · ' : '独立截图 · ') + (image.label || image.id), () => paintImage(scope, event, image, label, picker, stage));
+      option.dataset.imageId = image.id; picker.append(option);
+    });
+    paintImage(scope, event, candidates[0], label, picker, stage);
   }
   function openImageViewer(image, event) {
     const picture = node('img'); picture.src = image.src; picture.alt = image.label || ('步骤截图：' + actionTitle(event)); picture.title = '点击查看原始尺寸';
@@ -47,90 +55,37 @@ export const reportClientActions = String.raw`
       picture.title = actual ? '点击适应屏幕' : '点击查看原始尺寸';
     });
   }
-  function selectEvent(id, chosenImage) {
-    const scope = scopes[currentScope], event = scope.events.find(item => item.id === id); if (!event) return;
-    selectedId = id; const action = linkedAction(scope.caseIndex, event), root = get('action'); root.replaceChildren();
-    const facts = node('dl', 'facts');
-    let title;
-    if (event.type === 'assert') {
-      const expected = assertionValue(event);
-      const apis = apisForEvent(scope.caseIndex, event), api = apis[0];
-      const apiAssertion = event.kind === 'api' || event.kind === 'request';
-      title = apiAssertion ? '接口断言 · ' + (api ? apiLabel(api) : '未关联') : '检查：' + assertionTitle(event);
-      if (apiAssertion) {
-        if (api) humanFact(facts, '接口状态', api.status, has(api, 'status'), '未记录');
-        else humanFact(facts, '接口', '未关联接口证据', true);
-        const path = record(event.expect).path;
-        if (path) humanFact(facts, '断言字段', path, true);
-      } else {
-        humanFact(facts, '对象', targetSummary(event), true);
-      }
-      humanFact(facts, '条件', assertionCondition(event), true);
-      humanFact(facts, '期望', expected, expected !== undefined, '未记录', undefined, true);
-      actualFact(facts, '实测', event);
-      if (whitespaceNote(expected)) humanFact(facts, '空白检查', whitespaceNote(expected), true);
-      if (action) humanFact(facts, '对应动作', actionTitle(action), true);
-    } else if (event.type === 'action') {
-      title = actionTitle(event);
-      humanFact(facts, '目标', actionMeta(event), Boolean(actionMeta(event)), '未记录');
-      humanFact(facts, '结果', actionOutcome(event), true);
-      humanFact(facts, '耗时', duration(event), true);
-    } else if (event.type === 'error') {
-      title = '执行错误';
-      humanFact(facts, '错误', event.error && event.error.message || event.kind, true);
-      if (event.error && event.error.code) humanFact(facts, '错误码', event.error.code, true);
-    } else {
-      title = '辅助观察 · ' + event.kind;
-      actualFact(facts, '结果', event);
-      if (event.type === 'capture' && (record(record(event.valueSource).from).req_id || record(event.evidence).req || record(event.args).req)) {
-        humanFact(facts, '接口', apisForEvent(scope.caseIndex, event).map(apiLabel).join(' / ') || '未关联接口证据', true);
-      }
-      humanFact(facts, '时间', time(event.startedAt), true);
-    }
-    const heading = node('div', 'row between'); heading.append(node('span', 'kind', title), badge(status(event)), node('span', 'small muted', duration(event))); root.append(heading);
-    root.append(facts);
-    if (event.type === 'action' && /execute|script/i.test(event.kind)) root.append(node('p', 'alert', '脚本操作 · 只展示已记录脚本与返回，不推断为键盘或鼠标路径'));
-    if (event.error) root.append(node('p', 'error-message', (event.error.code || '') + ' ' + event.error.message));
-    const candidates = imageCandidates(scope.caseIndex, event), picker = get('images'); picker.replaceChildren();
-    const picked = chosenImage || candidates[0];
-    if (candidates.length > 1) candidates.forEach(image => {
-      const option = button((image.phase === 'after_action' ? '自动截图 · ' : '独立截图 · ') + (image.label || image.id), () => showImage(scope, event, image));
-      option.dataset.imageId = image.id;
-      option.setAttribute('aria-pressed', String(image === picked));
-      picker.append(option);
-    });
-    showImage(scope, event, picked);
-    const position = scope.events.indexOf(event); get('position').textContent = (position + 1) + '/' + scope.events.length;
-    get('previous').disabled = position === 0; get('next').disabled = position === scope.events.length - 1;
-    get('timeline').querySelectorAll('.event').forEach(entry => {
-      entry.setAttribute('aria-current', String(entry.dataset.eventId === event.id)); entry.classList.toggle('related', Boolean(action && action.id !== event.id && entry.dataset.eventId === action.id));
-    });
-    get('checks').querySelectorAll('.check').forEach(card => {
-      card.classList.toggle('selected', card.dataset.eventId === (selectedCheck || event.id));
-      card.classList.toggle('related', Boolean(event.type === 'action' && card.dataset.actionId && card.dataset.actionId === (event.actionId || event.id)));
-    });
-    const active = get('timeline').querySelector('[aria-current=true]'); if (active) active.scrollIntoView({ block: 'nearest' });
+  function selectCheck(id) {
+    checkRows.forEach(row => row.classList.toggle('selected', (row.dataset.eventIds || '').split(',').includes(id)));
+  }
+  function focusStep(id) {
+    const scope = scopes[currentScope], event = scope && scope.events.find(item => item.id === id); if (!event) return;
+    const actionId = event.type === 'action' ? event.id : event.actionId;
+    const blocks = Array.from(get('steps').querySelectorAll('.step'));
+    const target = blocks.find(item => item.dataset.eventId === id) || blocks.find(item => actionId && item.dataset.actionId === actionId);
+    blocks.forEach(item => item.setAttribute('aria-current', String(item === target)));
+    if (target) target.scrollIntoView({ block: 'nearest' });
   }
   function selectScope(index) {
     stopReplay(); currentScope = index; const scope = scopes[index]; currentCase = scope.caseIndex;
-    selectedId = undefined; selectedCheck = undefined; selectedImage = undefined;
+    selectedCheck = undefined;
     get('scenarios').querySelectorAll('.scenario').forEach(entry => entry.setAttribute('aria-current', String(Number(entry.dataset.index) === index)));
     get('cases').querySelectorAll('.case-row').forEach(row => row.setAttribute('aria-current', String(Number(row.dataset.case) === currentCase)));
-    renderContext(scope); renderChecks(scope); renderTimeline(scope); get('checks').scrollTop = 0;
+    renderContext(scope); renderChecks(scope); renderSteps(scope); get('checks').scrollTop = 0;
     const failure = scope.events.find(event => ['fail', 'error'].includes(status(event)));
     const notRun = scope.events.find(event => status(event) === 'not_run');
-    if (scope.events.length) selectEvent((failure || data.result === 'BLOCKED' && notRun || scope.events[0]).id);
-    else {
-      get('action').replaceChildren(node('p', 'muted', '本范围没有可展示的业务步骤'));
-      get('image-label').textContent = '无可展示步骤'; get('image-stage').replaceChildren(node('p', 'empty', '此场景未执行，或报告没有执行记录。'));
-      get('position').textContent = '0/0'; get('previous').disabled = true; get('next').disabled = true; get('images').replaceChildren();
-    }
+    const first = scope.events.length ? (failure || data.result === 'BLOCKED' && notRun || scope.events[0]) : undefined;
+    if (first) { selectCheck(first.id); focusStep(first.id); }
     updateReplayButton(); get('scope-status').replaceChildren(badge(scopeState(scope)));
   }
   function updateDirectoryVisibility() {
     const count = scopes.filter(scope => scope.caseIndex === currentCase).length;
     get('directory').hidden = count <= 1;
     get('nav-toggle').hidden = count <= 1;
+  }
+  function scrollDetailTop() {
+    const target = typeof document.querySelector === 'function' ? document.querySelector('.overview') : undefined;
+    if (target) target.scrollIntoView({ block: 'start' });
   }
   function selectCase(caseIndex) {
     currentCase = caseIndex;
@@ -141,8 +96,8 @@ export const reportClientActions = String.raw`
     selectScope((failure || entries[0]).index);
     renderCases();
     updateDirectoryVisibility();
+    scrollDetailTop();
   }
-  function move(offset) { const events = scopes[currentScope].events, position = events.findIndex(event => event.id === selectedId), next = events[position + offset]; if (next) selectEvent(next.id); }
   const replayRaf = callback => typeof requestAnimationFrame === 'function' ? requestAnimationFrame(callback) : setTimeout(callback, 16);
   const replayCancelRaf = id => typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame(id) : clearTimeout(id);
   let replayTimer, replayPlaying = false, replayFrames = [], replayTimes = [], replayIndex = 0, replayPosition = 0, replaySpeed = 1;
@@ -271,7 +226,6 @@ export const reportClientActions = String.raw`
     get('dialog-body').dataset.imageZoom = ''; get('dialog-title').textContent = title;
     get('dialog-body').replaceChildren(content); get('dialog').showModal(); get('dialog-close').focus();
   }
-  get('previous').addEventListener('click', () => move(-1)); get('next').addEventListener('click', () => move(1));
   get('flow-replay').addEventListener('click', openReplay);
   get('dialog-close').addEventListener('click', () => get('dialog').close()); get('dialog').addEventListener('close', () => { stopReplay(); get('dialog').classList.remove('image-viewer'); get('dialog-body').dataset.imageZoom = ''; if (lastFocus && lastFocus.isConnected) lastFocus.focus(); });
   get('run-info').addEventListener('click', () => {
@@ -292,6 +246,8 @@ export const reportClientActions = String.raw`
   const themeMedia = window.matchMedia('(prefers-color-scheme: dark)'); let themeOverride;
   function applyTheme() { const dark = themeOverride === undefined ? themeMedia.matches : themeOverride; document.documentElement.dataset.theme = dark ? 'dark' : 'light'; get('theme').textContent = dark ? '浅色' : '深色'; }
   get('theme').addEventListener('click', () => { themeOverride = document.documentElement.dataset.theme !== 'dark'; applyTheme(); }); themeMedia.addEventListener('change', applyTheme);
+  function syncTopHeight() { const topBar = get('top'); if (topBar && topBar.offsetHeight && document.documentElement.style) document.documentElement.style.setProperty('--top-h', topBar.offsetHeight + 'px'); }
+  syncTopHeight(); if (typeof window.addEventListener === 'function') window.addEventListener('resize', syncTopHeight);
   document.addEventListener('keydown', event => {
     if (get('dialog').open) return;
     if (event.key === 'Escape') { document.body.dataset.nav = ''; get('nav-toggle').setAttribute('aria-expanded', 'false'); return; }
@@ -299,7 +255,6 @@ export const reportClientActions = String.raw`
     if (event.target.closest('.scenarios') && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
       event.preventDefault(); const choices = Array.from(get('scenarios').querySelectorAll('.scenario')).filter(entry => !entry.hidden), position = choices.indexOf(event.target.closest('.scenario')), next = choices[position + (event.key === 'ArrowDown' ? 1 : -1)]; if (next) { next.click(); get('scenarios').querySelector('[data-index="' + next.dataset.index + '"]').focus(); } return;
     }
-    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); move(event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1); if (event.target.closest('.timeline')) { const active = get('timeline').querySelector('[aria-current=true]'); if (active) active.focus(); } }
   });
   let initialCase = 0;
   if (data.result === 'FAIL') { const index = data.cases.findIndex(testCase => testCase.result === 'FAIL'); if (index >= 0) initialCase = index; }

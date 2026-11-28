@@ -23,7 +23,7 @@ export function renderReportHtml(data: ReportData): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>${escapeHtml(projected.title)}</title><style>${reportStyles}</style></head><body>
 <a class="skip" href="#center">跳到报告正文</a>
-<header class="top">
+<header id="top" class="top">
   <div class="top-row">
     <div class="title-block"><span class="brand">e2et · 验收记录</span><h1 class="top-title">${escapeHtml(projected.title)}</h1></div>
     <div class="top-actions"><button id="nav-toggle" class="nav-toggle" type="button" aria-expanded="false" aria-controls="directory">场景目录</button><button id="theme" type="button">主题</button></div>
@@ -32,7 +32,7 @@ export function renderReportHtml(data: ReportData): string {
 </header>
 <div id="directory" class="directory"><div class="directory-head"><span>场景目录</span><label class="sr-only" for="search">搜索场景</label><input id="search" type="search" placeholder="搜索场景 / 状态"></div><nav id="scenarios" class="scenarios" aria-label="场景目录"></nav></div>
 <main id="center" class="report" tabindex="-1">
-  <section id="cases-section" class="cases-section" aria-label="用例结果"><div class="section-head"><div><h2>用例结果</h2><p>点击用例查看执行步骤与证据。</p></div><span id="case-count" class="small muted"></span></div><div id="cases" class="cases"></div></section>
+  <section id="cases-section" class="cases-section" aria-label="用例列表"><div class="section-head"><div><h2>用例列表</h2><p>点击用例查看执行步骤与证据。</p></div><span id="case-count" class="small muted"></span></div><div id="cases" class="cases"></div></section>
   <section class="overview" aria-label="验证范围"><div class="overview-main">
     <div id="case-actions" class="case-actions" aria-label="当前用例操作">
       <div class="row"><span id="case-status" class="badge"></span><span id="case-name" class="case-current-name"></span></div>
@@ -40,21 +40,13 @@ export function renderReportHtml(data: ReportData): string {
     </div>
     <div id="context" class="context"></div>
   </div><span id="scope-status"></span></section>
+  <section id="checks-section" class="plan-section" aria-label="验收计划">
+    <div class="section-head"><div><h2>验收计划</h2><p>每条需求一行：期望 · 实测 · 对应步骤；点一行查看该步骤与截图。</p></div><span id="check-count" class="small muted"></span></div>
+    <div id="checks" class="checks"></div>
+  </section>
   <section class="process" aria-label="执行步骤">
-    <div class="section-head"><div><h2>执行步骤</h2><p>点击步骤查看截图与结果；上一步 / 下一步可逐条核对。</p></div>
-      <div class="controls row"><button id="previous" type="button" aria-label="上一步">上一步</button><button id="next" type="button" aria-label="下一步">下一步</button><span id="position" class="small mono"></span></div></div>
-    <div class="process-body">
-      <nav id="timeline" class="timeline" aria-label="执行步骤"></nav>
-      <div class="step-detail">
-        <section id="action" class="action" aria-label="当前步骤事实"></section>
-        <section class="preview" aria-label="步骤截图">
-          <div class="preview-head"><div id="image-label" class="image-label"></div></div>
-          <div id="images" class="row small" aria-label="关联截图"></div>
-          <div id="image-stage" class="image-stage" aria-label="截图预览，点击图片全屏查看"></div>
-        </section>
-      </div>
-      <section class="checks-section" aria-label="检查结果"><div class="section-head"><div><h2>检查结果</h2><p>每条断言：对象 · 条件 · 期望 · 实测</p></div><span id="check-count" class="small muted"></span></div><div id="checks" class="checks"></div></section>
-    </div>
+    <div class="section-head"><div><h2>执行步骤</h2><p>按执行顺序平铺：每步结果、截图与接口证据。</p></div></div>
+    <div id="steps" class="steps"></div>
   </section>
 </main>
 <dialog id="dialog" aria-labelledby="dialog-title"><div class="row between"><h2 id="dialog-title"></h2><button id="dialog-close" type="button">关闭 · Esc</button></div><div id="dialog-body" class="dialog-body"></div></dialog>

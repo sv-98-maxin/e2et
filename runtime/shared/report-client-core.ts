@@ -28,27 +28,37 @@ export const reportClientCore = String.raw`
   const timelineOf = events => { const business = events.filter(isBusiness); return business.length ? business : events; };
   const actionNames = { open: '打开页面', refresh: '刷新页面', click: '点击', fill: '填写', type: '输入', press: '按键', execute: '执行脚本', hover: '悬停', scroll: '滚动', select: '选择', upload: '上传', wait: '等待', screenshot: '截图' };
   const actionTitle = event => event.intent || actionNames[event.kind] || event.kind;
-  const operatorLabels = { contains: '包含', equals: '等于', eq: '等于', ne: '不等于', gt: '大于', lt: '小于', '==': '等于', '!=': '不等于', '>': '大于', '<': '小于', '>=': '不小于', '<=': '不大于', exists: '存在', absent: '不存在' };
+  const operatorLabels = { contains: '包含', equals: '等于', eq: '等于', ne: '不等于', gt: '大于', lt: '小于', '==': '等于', '!=': '不等于', '>': '大于', '<': '小于', '>=': '不小于', '<=': '不大于', exists: '存在', absent: '不存在', visible: '元素可见' };
+  function consoleCheck(event) { return record(record(event.expect).check); }
+  function consoleExpectation(event) {
+    const check = consoleCheck(event);
+    if (check.noError === true) return { condition: '无错误日志', value: undefined };
+    const count = Number.isInteger(check.count) ? '出现 ' + check.count + ' 次' : '次数未记录';
+    return { condition: (check.level || 'error') + ' 级记录', value: (check.contains ? '含「' + check.contains + '」' : '任意内容') + count };
+  }
   function assertionCondition(event) {
+    if (event.kind === 'console') return consoleExpectation(event).condition;
     const expect = record(event.expect);
     const nested = record(expect[event.kind]);
     const condition = Object.keys(nested).length ? nested : expect;
     for (const key of ['contains', 'equals', 'op', 'state', 'count', 'check', 'matches']) {
-      if (has(condition, key)) return key === 'contains' || key === 'equals'
-        ? operatorLabels[key] : operatorLabels[condition[key]] || operatorLabels[key] || key;
+      if (has(condition, key)) return operatorLabels[key] || operatorLabels[condition[key]] || key;
     }
-    return ({ text: '文本', api: '接口返回', data: '页面数据', nav: '页面地址', state: '元素状态', count: '元素数量', absent: '元素不存在', exists: '元素存在' })[event.kind] || '检查';
+    return ({ text: '文本', api: '接口返回', data: '页面数据', nav: '页面地址', state: '元素状态', count: '元素数量', visible: '元素可见', absent: '元素不存在', exists: '元素存在' })[event.kind] || '检查';
   }
   function assertionValue(event) {
+    if (event.kind === 'console') return consoleExpectation(event).value;
     const expect = record(event.expect);
     if (has(expect, 'contains')) return expect.contains;
     if (has(expect, 'equals')) return expect.equals;
     if (has(expect, 'value')) return expect.value;
-    return has(event, 'resolvedExpected') ? event.resolvedExpected : undefined;
+    const value = has(event, 'resolvedExpected') ? event.resolvedExpected : undefined;
+    return value !== null && typeof value === 'object' ? undefined : value;
   }
   function assertionTitle(event) {
     const value = assertionValue(event);
     if (event.kind === 'text') return '文本' + assertionCondition(event) + (value === undefined ? '' : '「' + value + '」');
+    if (event.kind === 'console') return 'console 日志' + (value === undefined ? '' : ' · ' + value);
     if (event.kind === 'api') {
       const path = record(event.expect).path;
       return '接口字段' + (path ? '「' + path + '」' : '') + assertionCondition(event) + (value === undefined ? '' : '「' + value + '」');
@@ -61,11 +71,37 @@ export const reportClientCore = String.raw`
     if (event.kind === 'state') return '元素状态' + assertionCondition(event) + (value === undefined ? '' : '「' + value + '」');
     return assertionCondition(event) + (value === undefined ? '' : '「' + value + '」');
   }
+  function actualSummary(event) {
+    const actual = record(event.actual);
+    if (event.kind === 'console') {
+      if (typeof actual.actual === 'string' && actual.actual) return actual.actual;
+      const logs = Array.isArray(actual.logs) ? actual.logs : [];
+      if (logs.length) return logs.length + ' 条匹配';
+      return actual.pass === true ? '0 条匹配' : '存在匹配';
+    }
+    if (event.kind === 'visible' || event.kind === 'absent' || event.kind === 'exists') {
+      if (actual.resolved === false || actual.exists === false) return '未找到元素';
+      return Number.isInteger(actual.matches) ? '找到 ' + actual.matches + ' 个元素' : '已找到元素';
+    }
+    if (event.kind === 'text' && typeof event.actual === 'string') {
+      const expected = assertionValue(event);
+      if (typeof expected === 'string' && event.actual.includes(expected)) return '含「' + expected + '」';
+      const text = event.actual.replace(/\s+/g, ' ').trim();
+      return text.length > 60 ? text.slice(0, 60) + '…' : text;
+    }
+    if (event.kind === 'state') {
+      const labels = { visible: ['可见', '不可见'], enabled: ['可操作', '不可操作'], checked: ['已勾选', '未勾选'], exists: ['存在', '不存在'] };
+      for (const key of Object.keys(labels)) if (has(actual, key)) return labels[key][actual[key] ? 0 : 1];
+      return undefined;
+    }
+    return ['string', 'number', 'boolean'].includes(typeof event.actual) ? String(event.actual) : undefined;
+  }
   function targetOf(event) {
     const target = record(event.target);
     return record(target.within ?? target.target ?? event.target);
   }
   function targetSummary(event) {
+    if (event.kind === 'console') return 'console 日志';
     const target = targetOf(event);
     const selector = target.selector || target.css || target.label || target.text || target.name || String(record(event.expect).within || '').replace(/^css=/, '') || undefined;
     const matches = Array.isArray(target.candidates) && target.candidates.length ? target.candidates[0].matches : undefined;
@@ -95,7 +131,7 @@ export const reportClientCore = String.raw`
     };
   }
   const scopes = [];
-  let currentScope = 0, currentCase = 0, selectedId, selectedCheck, selectedImage, lastFocus;
+  let currentScope = 0, currentCase = 0, selectedCheck, lastFocus;
 
   function boundEvents(caseIndex, scenario, check) {
     const coverage = data.cases[caseIndex].acceptanceCoverage;

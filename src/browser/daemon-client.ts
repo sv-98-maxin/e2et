@@ -219,7 +219,9 @@ export class CdpSession {
     inputCleanup = false,
   ): Promise<T> {
     const ctx = requestContext.getStore();
+    // 清理命令必须在取消后仍然发出，否则 override 会残留在页面上。
     const cleanup = inputCleanup || method === 'Runtime.releaseObject' || method === 'Runtime.releaseObjectGroup'
+      || method === 'Emulation.clearDeviceMetricsOverride'
       || (method === 'Page.handleJavaScriptDialog' && params.accept === false);
     if (!cleanup && ctx?.signal.aborted) return Promise.reject(ctx.signal.reason);
     if (this.closed) return Promise.reject(new Error('CDP 会话已关闭'));

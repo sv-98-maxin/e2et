@@ -98,6 +98,11 @@ function renderDom(data: ReportData): { html: string; payload: any; el: (id: str
   return { html, payload: JSON.parse(payload), el: element };
 }
 
+/** 断言只在验收计划区（#checks）出现一次：有验收文档按计划项成行，否则按断言成行。 */
+function checkCards(dom: ReturnType<typeof renderDom>): FakeElement[] {
+  return dom.el('checks').querySelectorAll('.check');
+}
+
 /**
  * 反例取自 review-r2-sol-proof-wf2Yr7：真实生产结构（NetworkTrace.beginAction/finishAction
  * 写的 action、captureApi 真实 from 结构、显式 group、断言失败、多接口）。
@@ -344,8 +349,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'screenshot', after: 'a1', group: 'A', path: spDone });
     const { json } = await report(id);
     // 大数组首屏只给摘要，完整值收进折叠 details，不倒进对照行
-    const card = renderDom(json).el('checks').querySelectorAll('.check')
-      .find(item => item.textContent.includes('data.list'))!;
+    const card = checkCards(renderDom(json)).find(item => item.textContent.includes('data.list'))!;
     expect(card).toBeTruthy();
     const values = card.querySelectorAll('details');
     expect(values.length).toBeGreaterThan(0);
@@ -438,7 +442,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     expect(diagnostics.textContent).toContain('后端失败诊断');
     expect(diagnostics.textContent).toContain('trace-r1');
     expect(diagnostics.textContent).toContain('https://example.test/fail.json');
-    const card = dom.el('checks').querySelectorAll('.check')[0]!;
+    const card = checkCards(dom)[0]!;
     expect(card.textContent).toContain('data.tip');
     expect(card.textContent).toContain('actual');
     expect(card.textContent).toContain('traceId · trace-r1');
@@ -583,7 +587,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       }],
       coverage: { plan: ['验证净含量'], executed: ['验证净含量'], missing: [], unplanned: [] },
     }));
-    const checks = dom.el('checks');
+    const checks = checkCards(dom)[0]!;
     expect(checks.textContent).toContain('净含量');
     // 首屏对照（details 外的 facts）不直显接口，接口收进默认关闭的技术证据
     expect(checks.querySelectorAll('.facts')[0]!.textContent).not.toContain('/api/item.json');
@@ -636,10 +640,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       result: 'BLOCKED',
       coverage: { plan: null, executed: ['旧步骤'], missing: [], unplanned: [] },
     }));
-    // 主时间线只展示业务检查，原始 observation 由检查结果与「原始 trace」承载
-    expect(dom.el('timeline').textContent).toContain('检查：文本包含');
-    expect(dom.el('timeline').textContent).not.toContain('observation');
-    expect(dom.el('action').textContent).toContain('plain text response');
+    // 主时间线只展示动作步骤；无动作归属的断言落在底部兜底区
+    expect(dom.el('checks').textContent).toContain('文本包含');
+    expect(dom.el('steps').textContent).not.toContain('observation');
+    expect(dom.el('steps').textContent).toContain('plain text response');
     expect(dom.el('checks').querySelectorAll('.tech-evidence')).toHaveLength(0);
     expect(dom.payload.cases[0].steps[0].apis[0].respBody).toBe('plain text response');
     expect(dom.payload.cases[0].events[0].actual).toBe('plain text response');
@@ -727,10 +731,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'ok' }, actual: 'ok', evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const checks = renderDom(json).el('checks');
-    expect(checks.querySelectorAll('.trace-id')).toHaveLength(0);
+    const cards = checkCards(renderDom(json));
+    expect(cards.flatMap(card => card.querySelectorAll('.trace-id'))).toHaveLength(0);
     // traceId 仍在默认关闭的技术证据里
-    expect(checks.querySelectorAll('.tech-evidence')[0]!.textContent).toContain('trace-pass-200');
+    expect(cards.flatMap(card => card.querySelectorAll('.tech-evidence'))[0]!.textContent).toContain('trace-pass-200');
   });
 
   it('FAIL 步骤 + 200 接口有 traceId → 展示 trace-box', async () => {
@@ -741,7 +745,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: false, expect: { path: 'data.tip', op: '==', value: 'expected' }, actual: 'actual', evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    const traces = checkCards(renderDom(json)).flatMap(card => card.querySelectorAll('.trace-id'));
     expect(traces).toHaveLength(1);
     expect(traces[0]!.textContent).toContain('trace-fail-200');
   });
@@ -755,7 +759,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     // api assert 引用 r1，使 request 关联到步骤；步骤本身 pass（assert 通过），但 HTTP 500 仍应展示 trace-box
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'error', op: '==', value: 'internal' }, actual: 'internal', evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    const traces = checkCards(renderDom(json)).flatMap(card => card.querySelectorAll('.trace-id'));
     expect(traces).toHaveLength(1);
     expect(traces[0]!.textContent).toContain('trace-err-500');
   });
@@ -768,7 +772,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [] });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'ok' }, actual: 'ok', evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const traces = renderDom(json).el('checks').querySelectorAll('.trace-id');
+    const traces = checkCards(renderDom(json)).flatMap(card => card.querySelectorAll('.trace-id'));
     expect(traces).toHaveLength(1);
     expect(traces[0]!.textContent).toContain('trace-blocked-200');
   });
@@ -783,8 +787,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data.tip', op: '==', value: 'hello' }, actual: 'hello', evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const checks = renderDom(json).el('checks');
-    const card = checks.querySelectorAll('.check')[0]!;
+    const card = checkCards(renderDom(json))[0]!;
     // focused 等价：断言路径、期望与实测在首屏对照里
     expect(card.textContent).toContain('data.tip');
     expect(card.textContent).toContain('hello');
@@ -804,9 +807,9 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     // text 类型断言，非 api
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'text', expect: { contains: 'hello' }, actual: 'hello', pass: true, evidence: [] });
     const { json } = await report(id);
-    const checks = renderDom(json).el('checks');
-    expect(checks.querySelectorAll('.trace-id')).toHaveLength(0);
-    expect(checks.textContent).toContain('hello');
+    const cards = checkCards(renderDom(json));
+    expect(cards.flatMap(card => card.querySelectorAll('.trace-id'))).toHaveLength(0);
+    expect(cards.map(card => card.textContent).join('')).toContain('hello');
   });
 
   it('focused display 基础类型内联：string/number/boolean/null', async () => {
@@ -820,8 +823,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'b', op: '==', value: true }, actual: true, evidence: [{ req_id: 'r1' }] });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'x', op: '==', value: null }, actual: null, evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const facts = renderDom(json).el('checks').querySelectorAll('.check')
-      .flatMap(card => card.querySelectorAll('.facts').slice(0, 1));
+    const facts = checkCards(renderDom(json)).flatMap(card => card.querySelectorAll('.facts').slice(0, 1));
     const text = facts.map(item => item.textContent).join('');
     // 字符串与数值/布尔/null 保持类型区别
     expect(text).toContain('"hello"');
@@ -840,15 +842,14 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     appendTraceEvent(id, { t: 'action', id: 'a1', ts: 1, ts_end: 2, kind: 'click', intent: '动作-A', group: 'A', result: { ok: true }, requests: [], screenshot_path: sp });
     appendTraceEvent(id, { t: 'assert', after: 'a1', kind: 'api', pass: true, expect: { path: 'data', op: 'exists' }, actual: null, evidence: [{ req_id: 'r1' }] });
     const { json } = await report(id);
-    const checks = renderDom(json).el('checks');
-    const tech = checks.querySelectorAll('.tech-evidence')[0]!;
+    const tech = checkCards(renderDom(json)).flatMap(card => card.querySelectorAll('.tech-evidence'))[0]!;
     // 完整对象与数组原文默认折叠保留
     expect(tech.open).toBe(false);
     expect(tech.textContent).toContain('"list":[1,2]');
     expect(tech.textContent).toContain('"meta":{"count":2}');
   });
 
-  it('主时间线只展示业务步骤，原始 action/observation/screenshot 默认隐藏', () => {
+  it('主时间线只展示动作与错误，断言只进验收计划区', () => {
     const dom = renderDom(renderData({
       cases: [{
         id: 'TC-01',
@@ -864,9 +865,11 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       }],
       coverage: { plan: null, executed: ['打开页面并检查文本'], missing: [], unplanned: [] },
     }));
-    const timeline = dom.el('timeline').textContent;
+    const timeline = dom.el('steps').textContent;
     expect(timeline).toContain('打开 FDE 详情页');
-    expect(timeline).toContain('检查：文本包含');
+    expect(timeline).toContain('断言 1/1');
+    expect(timeline).not.toContain('检查：文本包含');
+    expect(checkCards(dom)[0]!.textContent).toContain('文本包含');
     expect(timeline).not.toContain('action / open');
     expect(timeline).not.toContain('screenshot / screenshot');
     expect(timeline).not.toContain('observation');
@@ -915,7 +918,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     expect(dom.el('case-count').textContent).toContain('1 失败');
     expect(dom.el('cases-section').hidden).toBe(false);
     expect(dom.el('context').textContent).toContain('接口监控');
-    expect(dom.el('checks').textContent).toContain('接口断言');
+    expect(checkCards(dom).map(card => card.textContent).join('')).toContain('接口断言');
   });
 
   it('接口断言：显示接口与状态，接口证据折叠，不露技术字段', () => {
@@ -924,7 +927,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       cases: [apiCase()],
       coverage: { plan: ['接口监控'], executed: ['接口监控'], missing: [], unplanned: [] },
     }));
-    const checks = dom.el('checks').textContent;
+    const checks = checkCards(dom).map(card => card.textContent).join('');
     expect(checks).toContain('接口断言 · GET /api/item/stock');
     expect(checks).toContain('接口状态');
     expect(checks).toContain('200');
@@ -933,13 +936,13 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     expect(checks).toContain('0');
     expect(checks).not.toContain('技术字段');
     expect(checks).not.toContain('事件 ID');
-    const evidence = dom.el('checks').querySelectorAll('.tech-evidence')[0]!;
+    const evidence = checkCards(dom).flatMap(card => card.querySelectorAll('.tech-evidence'))[0]!;
     expect(evidence.open).toBe(false);
     expect(evidence.textContent).toContain('接口证据');
     expect(evidence.textContent).toContain('trace-api-1');
     expect(evidence.textContent).toContain('{"data":{"stock":0}}');
     expect(evidence.textContent).not.toMatch(/\d+ 字符/);
-    const stage = dom.el('image-stage').textContent;
+    const stage = dom.el('steps').querySelectorAll('.image-stage').map(item => item.textContent).join('');
     expect(stage).toContain('GET');
     expect(stage).toContain('/api/item/stock');
     expect(stage).toContain('HTTP 200');
@@ -995,7 +998,7 @@ describe('report 真实判定回归（review-r2 反例）', () => {
     expect(dom.el('flow-replay').hidden).toBe(false);
   });
 
-  it('刷新动作展示自动截图，断言步骤展示完成态截图', () => {
+  it('有显式截图时不再重复展示自动截图', () => {
     const autoSrc = `data:image/png;base64,${PNG}`;
     const finalSrc = 'data:image/png;base64,AAAA';
     const cases = (assertStatus: string) => renderData({
@@ -1021,12 +1024,10 @@ describe('report 真实判定回归（review-r2 反例）', () => {
       }],
     });
     const actionDom = renderDom(cases('pass'));
-    expect(actionDom.el('image-stage').querySelector('img')?.src).toBe(autoSrc);
-    expect(actionDom.el('images').children.map(option => option.textContent)).toEqual(['自动截图 · 刷新中', '独立截图 · 完成态']);
-    expect(actionDom.el('images').children[0]?.getAttribute('aria-pressed')).toBe('true');
+    expect(actionDom.el('steps').querySelectorAll('.image-stage')[0]!.querySelector('img')?.src).toBe(finalSrc);
+    expect(actionDom.el('steps').querySelectorAll('.step-images')[0]!.children).toHaveLength(0);
     const assertDom = renderDom(cases('fail'));
-    expect(assertDom.el('image-stage').querySelector('img')?.src).toBe(finalSrc);
-    expect(assertDom.el('images').children.map(option => option.textContent)).toEqual(['独立截图 · 完成态', '自动截图 · 刷新中']);
-    expect(assertDom.el('images').children[0]?.getAttribute('aria-pressed')).toBe('true');
+    expect(assertDom.el('steps').querySelectorAll('.image-stage')[0]!.querySelector('img')?.src).toBe(finalSrc);
+    expect(assertDom.el('steps').querySelectorAll('.step-images')[0]!.children).toHaveLength(0);
   });
 });

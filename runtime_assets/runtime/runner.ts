@@ -141,7 +141,10 @@ export async function runTest(ir: IRv2, opts: RunnerOptions): Promise<void> {
         screenshotNotice = '截图缺失：页面已关闭';
       } else {
         try {
-          screenshot = 'data:image/png;base64,' + (await page.screenshot({ type: 'png' })).toString('base64');
+          let png: Buffer;
+          try { png = await page.screenshot({ type: 'png', fullPage: true }); }
+          catch { png = await page.screenshot({ type: 'png' }); }
+          screenshot = 'data:image/png;base64,' + png.toString('base64');
         } catch (error) {
           screenshotNotice = `截图失败：${error instanceof Error ? error.message : String(error)}`;
         }

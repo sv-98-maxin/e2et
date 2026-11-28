@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test';
+import { resolveViewport } from './shared/viewport';
 
 export default defineConfig({
   testDir: '../__tests__',
@@ -7,7 +8,7 @@ export default defineConfig({
   retries: 0,
   use: {
     headless: true,
-    viewport: { width: 1280, height: 720 },
+    viewport: resolveViewport(),
   },
   reporter: 'line',
 });

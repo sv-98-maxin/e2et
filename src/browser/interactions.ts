@@ -11,6 +11,7 @@ import type { CdpSession } from './daemon-client.js';
 import { collectPageState, CdpReadError, type InteractiveElement, type PageState } from './page-state.js';
 import { resolveTextTarget, TextTargetError } from './text-locator.js';
 import { nativeDOMFunction } from './locator-query.js';
+import { holdViewport, releaseViewport } from './viewport.js';
 
 export interface ResolvedTarget {
   backendNodeId: number;
@@ -1364,27 +1365,32 @@ export async function extractContent(session: CdpSession, selector?: string): Pr
 
 export async function screenshot(session: CdpSession, fullPage: boolean): Promise<string> {
   await session.send('Page.enable');
-  // captureBeyondViewport 单独不保证全页（Chrome 版本差异、内容视口裁剪）。
-  // full-page 时先取 layout metrics 拿完整内容尺寸，用 clip 精确裁剪整页。
-  if (fullPage) {
-    const metrics = await session.send<{
-      // cssContentSize 是 CSS 像素尺寸（clip 需要）；contentSize 是废弃 DP 尺寸。
-      cssContentSize: { width: number; height: number };
-    }>('Page.getLayoutMetrics');
-    const w = Math.ceil(metrics.cssContentSize.width);
-    const h = Math.ceil(metrics.cssContentSize.height);
+  await holdViewport(session);
+  try {
+    // captureBeyondViewport 单独不保证全页（Chrome 版本差异、内容视口裁剪）。
+    // full-page 时先取 layout metrics 拿完整内容尺寸，用 clip 精确裁剪整页。
+    if (fullPage) {
+      const metrics = await session.send<{
+        // cssContentSize 是 CSS 像素尺寸（clip 需要）；contentSize 是废弃 DP 尺寸。
+        cssContentSize: { width: number; height: number };
+      }>('Page.getLayoutMetrics');
+      const w = Math.ceil(metrics.cssContentSize.width);
+      const h = Math.ceil(metrics.cssContentSize.height);
+      const res = await session.send<{ data: string }>('Page.captureScreenshot', {
+        format: 'png',
+        clip: { x: 0, y: 0, width: w, height: h, scale: 1 },
+        captureBeyondViewport: true,
+      });
+      return res.data;
+    }
     const res = await session.send<{ data: string }>('Page.captureScreenshot', {
       format: 'png',
-      clip: { x: 0, y: 0, width: w, height: h, scale: 1 },
-      captureBeyondViewport: true,
+      captureBeyondViewport: fullPage,
     });
     return res.data;
+  } finally {
+    await releaseViewport(session);
   }
-  const res = await session.send<{ data: string }>('Page.captureScreenshot', {
-    format: 'png',
-    captureBeyondViewport: fullPage,
-  });
-  return res.data;
 }
 
 export async function navigate(session: CdpSession, url: string): Promise<void> {
