@@ -9,7 +9,8 @@ import { dispatch as rawDispatch } from '../cli/router.js';
 import type { RouterDeps } from '../cli/context.js';
 import * as packageVersion from '../package-version.js';
 import { irDigest, renderIR, testDigest } from '../render/render.js';
-import { parseIRv2, type IRv2, type Step } from '../ir/schema.js';
+import { type IRv2, type Step } from '../ir/schema.js';
+import { loadStaticCase } from '../cases/snapshot.js';
 
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof fs>();
@@ -77,7 +78,7 @@ function writeSources() {
   fs.writeFileSync(traceFile, events.map((event) => JSON.stringify(event)).join('\n') + '\n');
 }
 const envelope = () => JSON.parse(stdout.at(-1)!);
-const expectedTest = () => { const parsed = parseIRv2(ir); if (!parsed.ok) throw Error('bad fixture'); return Buffer.from(renderIR(parsed.ir)); };
+const expectedTest = () => { const snapshot = loadStaticCase(source); if (!snapshot || !('ir' in snapshot)) throw Error('bad fixture'); return Buffer.from(renderIR(snapshot.ir)); };
 const targetRoot = () => path.join(library, 'verify-case');
 const target = (kind: 'ir' | 'test' | 'fixture') => kind === 'ir'
   ? path.join(targetRoot(), 'verify-case.ir.json')
